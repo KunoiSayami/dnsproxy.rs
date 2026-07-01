@@ -1,0 +1,39 @@
+[package]
+name = "doh-upstream"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
+
+[features]
+default = ["http3"]
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:http"]
+
+[dependencies]
+hickory-proto = "=0.24.4"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
+tower-service = "0.3"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", optional = true }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+base64 = "0.22"
+thiserror = "2"
+rand = "0.8"
+async-trait = "0.1"
+futures-util = "0.3"
+
+quinn = { version = "0.11", optional = true }
+h3 = { version = "0.0.7", optional = true }
+h3-quinn = { version = "0.0.9", optional = true }
+http = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2"] }
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", features = ["ring"] }

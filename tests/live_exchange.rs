@@ -6,11 +6,11 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{rdata::A, Name, RData, Record, RecordType};
+use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -21,7 +21,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
 
-use doh_upstream::{options::HttpVersion, DohUpstream, Options};
+use doh_upstream::{DohUpstream, Options, options::HttpVersion};
 
 /// Generates a self-signed cert for `localhost`, mirroring the ephemeral
 /// certs the Go tests spin up via `httptest`.

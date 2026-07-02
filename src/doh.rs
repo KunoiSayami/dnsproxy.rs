@@ -5,8 +5,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::header::{ACCEPT, USER_AGENT};
 use hyper::{Request, Uri};
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use hickory_proto::op::Message;
 
-use crate::bootstrap::{resolve_dial_context, Resolver, SystemResolver};
+use crate::bootstrap::{Resolver, SystemResolver, resolve_dial_context};
 use crate::error::DohError;
 use crate::options::{HttpVersion, Options};
 use crate::wire::{decode_response, encode_request};
@@ -336,7 +336,7 @@ impl tower_service::Service<Uri> for HttpsConnector {
             let tcp = match conn {
                 crate::bootstrap::Conn::Tcp(s) => s,
                 crate::bootstrap::Conn::Udp(..) => {
-                    return Err(DohError::Http("expected tcp connection".into()))
+                    return Err(DohError::Http("expected tcp connection".into()));
                 }
             };
 

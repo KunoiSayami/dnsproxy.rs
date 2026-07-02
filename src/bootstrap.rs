@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::{lookup_host, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 use crate::error::DohError;
 
@@ -192,11 +192,7 @@ pub async fn resolve_dial_context(
     let mut ips = ips;
     ips.sort_by_key(|ip| {
         let is_v6 = ip.is_ipv6();
-        if prefer_v6 {
-            !is_v6
-        } else {
-            is_v6
-        }
+        if prefer_v6 { !is_v6 } else { is_v6 }
     });
 
     let addrs = ips

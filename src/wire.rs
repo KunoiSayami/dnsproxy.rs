@@ -1,8 +1,8 @@
 //! RFC 8484 message framing: packing requests for the `dns=` query parameter
 //! and validating/unpacking responses.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 

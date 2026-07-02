@@ -13,6 +13,8 @@ pub mod doh3;
 pub mod error;
 pub mod options;
 pub mod server;
+pub mod upstream_config;
+pub mod upstream_url;
 pub mod wire;
 
 pub use cache::{Cache, CacheOptions};
@@ -20,3 +22,5 @@ pub use doh::DohUpstream;
 pub use error::DohError;
 pub use options::{HttpVersion, Options};
 pub use server::{Handler, serve, serve_all};
+pub use upstream_config::UpstreamConfig;
+pub use upstream_url::parse_upstream;

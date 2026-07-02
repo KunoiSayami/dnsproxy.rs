@@ -23,6 +23,10 @@ to prefer it, matching the Go client's probing behavior.
 - An optional in-memory response cache (`Cache`), keyed by question name,
   type, and class, with configurable TTL floor/ceiling and an LRU eviction
   policy
+- Domain-scoped upstream routing (`UpstreamConfig`), parsing an AdGuard
+  dnsproxy-style upstream list — including `[/domain1/.../domainN/]upstream1
+  upstream2 ...` rules — with hierarchical suffix matching and in-order
+  fallback across an upstream rule's servers
 
 ## Standalone binary
 
@@ -30,7 +34,18 @@ The crate also builds a `doh-upstream` binary: a minimal standalone
 DNS-over-HTTPS forwarding proxy.
 
 ```sh
-doh-upstream --upstream https://dns.google/dns-query --port 53
+echo 'https://dns.google/dns-query' > upstreams.txt
+doh-upstream --upstream-file upstreams.txt --port 53
+```
+
+Domain-scoped routing, with fallback across upstreams tried in order:
+
+```
+# default upstream, used for anything not matched below
+https://dns.google/dns-query
+
+# reserved for example.com and its subdomains; tries 1.1.1.1 first
+[/example.com/]https://1.1.1.1/dns-query h3://1.0.0.1/dns-query
 ```
 
 Useful flags:
@@ -39,7 +54,7 @@ Useful flags:
 |---|---|
 | `--listen <addr>` | Address to listen on for plain DNS (UDP+TCP). Repeatable. |
 | `--port <port>` | Shorthand for listening on the IPv4 and IPv6 wildcard addresses on this port. |
-| `--upstream <url>` | Upstream DoH server URL. May embed HTTP Basic Auth as `user:pass@host`. |
+| `--upstream-file <path>` | Path to an upstream config file (see above). Upstreams are DoH URLs (`https://`, or `h3://` for HTTP/3-only), optionally with HTTP Basic Auth as `user:pass@host`. |
 | `--timeout <secs>` | Overall timeout for exchanges, bootstrap lookups, and H3 probes (default `10`). |
 | `--insecure` | Disable TLS certificate verification. |
 | `--prefer-ipv6` | Prefer IPv6 addresses when the bootstrap resolves multiple families. |

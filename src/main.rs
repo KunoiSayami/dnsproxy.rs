@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use hyper::Uri;
 
-use doh_upstream::{Cache, CacheOptions, DohUpstream, HttpVersion, Options};
+use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig};
 
 pub fn init_log(verbose: u8, default_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
@@ -59,11 +59,17 @@ struct Args {
     #[arg(long, conflicts_with = "listen")]
     port: Option<u16>,
 
-    /// Upstream DoH server, e.g. https://dns.google/dns-query. May include
-    /// HTTP Basic Auth credentials as userinfo, e.g.
-    /// https://user:pass@example.com/dns-query.
+    /// Path to an upstream config file, one rule per line. A line is either
+    /// a plain upstream (the default, used for anything not matched by a
+    /// domain rule) or `[/domain1/.../domainN/]upstream1 upstream2 ...` to
+    /// reserve upstreams for those domains and their subdomains, tried in
+    /// order on failure. Upstreams are DoH URLs, e.g.
+    /// https://dns.google/dns-query or h3://1.1.1.1/dns-query (HTTP/3-only),
+    /// optionally with HTTP Basic Auth userinfo
+    /// (https://user:pass@example.com/dns-query). Blank lines and lines
+    /// starting with # are ignored.
     #[arg(long)]
-    upstream: String,
+    upstream_file: PathBuf,
 
     /// Overall timeout for exchanges, bootstrap lookups, and H3 probes, in seconds.
     #[arg(long, default_value_t = 10)]
@@ -128,61 +134,6 @@ impl Args {
     }
 }
 
-/// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
-/// since `http::Uri` treats the whole authority as opaque and won't parse it
-/// for us. Returns the credentials (if any) and the URL with userinfo removed.
-fn extract_userinfo(
-    url: &str,
-) -> Result<(Option<(String, String)>, String), Box<dyn std::error::Error>> {
-    let (scheme_sep, rest) = url
-        .split_once("://")
-        .ok_or("--upstream must be an absolute URL")?;
-
-    let Some(at) = rest.rfind('@') else {
-        return Ok((None, url.to_owned()));
-    };
-    let (userinfo, host_and_path) = rest.split_at(at);
-    let host_and_path = &host_and_path[1..]; // skip '@'
-
-    let (user, pass) = userinfo
-        .split_once(':')
-        .ok_or("userinfo in --upstream must be user:pass")?;
-
-    Ok((
-        Some((user.to_owned(), pass.to_owned())),
-        format!("{scheme_sep}://{host_and_path}"),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_userinfo;
-
-    #[test]
-    fn no_userinfo() {
-        let (auth, url) = extract_userinfo("https://example.com/dns-query").unwrap();
-        assert_eq!(auth, None);
-        assert_eq!(url, "https://example.com/dns-query");
-    }
-
-    #[test]
-    fn userinfo_with_at_in_password() {
-        let (auth, url) = extract_userinfo("https://user:p@ss@example.com/dns-query").unwrap();
-        assert_eq!(auth, Some(("user".to_owned(), "p@ss".to_owned())));
-        assert_eq!(url, "https://example.com/dns-query");
-    }
-
-    #[test]
-    fn userinfo_without_colon_is_rejected() {
-        assert!(extract_userinfo("https://baduser@example.com/dns-query").is_err());
-    }
-
-    #[test]
-    fn missing_scheme_separator_is_rejected() {
-        assert!(extract_userinfo("example.com/dns-query").is_err());
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -194,17 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("no CryptoProvider installed yet");
 
-    let (basic_auth, stripped_upstream) = extract_userinfo(&args.upstream)?;
-    let upstream_uri: Uri = stripped_upstream
-        .parse()
-        .map_err(|e| format!("invalid --upstream: {e}"))?;
-
-    let host = upstream_uri
-        .host()
-        .ok_or("--upstream must include a host")?
-        .to_owned();
-    let path = upstream_uri.path().to_owned();
-
     #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut http_versions = vec![HttpVersion::Http11, HttpVersion::Http2];
     #[cfg(feature = "http3")]
@@ -212,25 +152,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_versions.push(HttpVersion::Http3);
     }
 
-    let opts = Options {
+    let base_opts = Options {
         http_versions,
         timeout: Some(Duration::from_secs(args.timeout)),
         insecure_skip_verify: args.insecure,
         prefer_ipv6: args.prefer_ipv6,
-        basic_auth,
         ..Default::default()
     };
 
-    let upstream = Arc::new(DohUpstream::new(
-        &host,
-        upstream_uri.port_u16(),
-        &path,
-        opts,
-    ));
-    let listen_addrs = args.listen_addrs();
-    tracing::info!(listen = ?listen_addrs, upstream = %upstream.address(), "forwarding");
+    let upstream_text = std::fs::read_to_string(&args.upstream_file)
+        .map_err(|e| format!("reading {}: {e}", args.upstream_file.display()))?;
+    let lines: Vec<&str> = upstream_text.lines().collect();
+    let upstream_config = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {
+        let joined = errs
+            .iter()
+            .map(|(idx, e)| format!("line {}: {e}", idx + 1))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("parsing {}: {joined}", args.upstream_file.display())
+    })?;
 
-    let mut handler = upstream.into_handler();
+    let listen_addrs = args.listen_addrs();
+    tracing::info!(listen = ?listen_addrs, upstream_file = %args.upstream_file.display(), "forwarding");
+
+    let mut handler = Arc::new(upstream_config).into_handler();
     if args.cache {
         let cache_opts = CacheOptions {
             size: NonZeroUsize::new(args.cache_size).ok_or("--cache-size must be nonzero")?,

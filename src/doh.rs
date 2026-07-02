@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
-use hyper::header::{ACCEPT, USER_AGENT};
+use hyper::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use hyper::{Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
@@ -36,6 +37,7 @@ pub struct DohUpstream {
     prefer_ipv6: bool,
     timeout: Option<Duration>,
     insecure_skip_verify: bool,
+    basic_auth_header: Option<String>,
 
     client: Mutex<Option<Client<HttpsConnector, Empty<Bytes>>>>,
 }
@@ -46,17 +48,24 @@ impl DohUpstream {
     pub fn new(host: &str, port: Option<u16>, path: &str, opts: Options) -> Self {
         let port = port.unwrap_or(DEFAULT_PORT_DOH);
         let addr_redacted = format!("https://{host}:{port}{path}");
+        let http_versions = opts.resolved_http_versions();
+        let basic_auth_header = opts.basic_auth.map(|(user, pass)| {
+            let credentials =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+            format!("Basic {credentials}")
+        });
 
         Self {
             host: host.to_owned(),
             port,
             path: path.to_owned(),
             addr_redacted,
-            http_versions: opts.resolved_http_versions(),
+            http_versions,
             resolver: opts.bootstrap.unwrap_or_else(|| Arc::new(SystemResolver)),
             prefer_ipv6: opts.prefer_ipv6,
             timeout: opts.timeout,
             insecure_skip_verify: opts.insecure_skip_verify,
+            basic_auth_header,
             client: Mutex::new(None),
         }
     }
@@ -173,9 +182,13 @@ impl DohUpstream {
         .parse()
         .map_err(|e| DohError::Http(format!("building request uri: {e}")))?;
 
-        let http_req = Request::get(uri)
+        let mut builder = Request::get(uri)
             .header(USER_AGENT, "")
-            .header(ACCEPT, "application/dns-message")
+            .header(ACCEPT, "application/dns-message");
+        if let Some(auth) = &self.basic_auth_header {
+            builder = builder.header(AUTHORIZATION, auth);
+        }
+        let http_req = builder
             .body(Empty::<Bytes>::new())
             .map_err(|e| DohError::Http(format!("building request: {e}")))?;
 

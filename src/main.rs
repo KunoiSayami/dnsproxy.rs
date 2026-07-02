@@ -14,9 +14,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:53")]
     listen: SocketAddr,
 
-    /// Upstream DoH server, e.g. https://dns.google/dns-query.
+    /// Upstream DoH server, e.g. https://dns.google/dns-query. May include
+    /// HTTP Basic Auth credentials as userinfo, e.g.
+    /// https://user:pass@example.com/dns-query.
     #[arg(long)]
-    upstream: Uri,
+    upstream: String,
 
     /// Overall timeout for exchanges, bootstrap lookups, and H3 probes, in seconds.
     #[arg(long, default_value_t = 10)]
@@ -36,6 +38,61 @@ struct Args {
     http3: bool,
 }
 
+/// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
+/// since `http::Uri` treats the whole authority as opaque and won't parse it
+/// for us. Returns the credentials (if any) and the URL with userinfo removed.
+fn extract_userinfo(
+    url: &str,
+) -> Result<(Option<(String, String)>, String), Box<dyn std::error::Error>> {
+    let (scheme_sep, rest) = url
+        .split_once("://")
+        .ok_or("--upstream must be an absolute URL")?;
+
+    let Some(at) = rest.rfind('@') else {
+        return Ok((None, url.to_owned()));
+    };
+    let (userinfo, host_and_path) = rest.split_at(at);
+    let host_and_path = &host_and_path[1..]; // skip '@'
+
+    let (user, pass) = userinfo
+        .split_once(':')
+        .ok_or("userinfo in --upstream must be user:pass")?;
+
+    Ok((
+        Some((user.to_owned(), pass.to_owned())),
+        format!("{scheme_sep}://{host_and_path}"),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_userinfo;
+
+    #[test]
+    fn no_userinfo() {
+        let (auth, url) = extract_userinfo("https://example.com/dns-query").unwrap();
+        assert_eq!(auth, None);
+        assert_eq!(url, "https://example.com/dns-query");
+    }
+
+    #[test]
+    fn userinfo_with_at_in_password() {
+        let (auth, url) = extract_userinfo("https://user:p@ss@example.com/dns-query").unwrap();
+        assert_eq!(auth, Some(("user".to_owned(), "p@ss".to_owned())));
+        assert_eq!(url, "https://example.com/dns-query");
+    }
+
+    #[test]
+    fn userinfo_without_colon_is_rejected() {
+        assert!(extract_userinfo("https://baduser@example.com/dns-query").is_err());
+    }
+
+    #[test]
+    fn missing_scheme_separator_is_rejected() {
+        assert!(extract_userinfo("example.com/dns-query").is_err());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rustls needs a process-wide CryptoProvider installed before any TLS
@@ -46,12 +103,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let host = args
-        .upstream
+    let (basic_auth, stripped_upstream) = extract_userinfo(&args.upstream)?;
+    let upstream_uri: Uri = stripped_upstream
+        .parse()
+        .map_err(|e| format!("invalid --upstream: {e}"))?;
+
+    let host = upstream_uri
         .host()
         .ok_or("--upstream must include a host")?
         .to_owned();
-    let path = args.upstream.path().to_owned();
+    let path = upstream_uri.path().to_owned();
 
     #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut http_versions = vec![HttpVersion::Http11, HttpVersion::Http2];
@@ -65,12 +126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout: Some(Duration::from_secs(args.timeout)),
         insecure_skip_verify: args.insecure,
         prefer_ipv6: args.prefer_ipv6,
+        basic_auth,
         ..Default::default()
     };
 
     let upstream = Arc::new(DohUpstream::new(
         &host,
-        args.upstream.port_u16(),
+        upstream_uri.port_u16(),
         &path,
         opts,
     ));

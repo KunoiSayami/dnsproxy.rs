@@ -48,6 +48,10 @@ pub struct Options {
 
     /// Prefer IPv6 addresses when the bootstrap resolves multiple families.
     pub prefer_ipv6: bool,
+
+    /// HTTP Basic Auth credentials (username, password) sent with every
+    /// request, e.g. as parsed from a `https://user:pass@host/path` upstream.
+    pub basic_auth: Option<(String, String)>,
 }
 
 impl Default for Options {
@@ -58,6 +62,7 @@ impl Default for Options {
             timeout: Some(Duration::from_secs(10)),
             insecure_skip_verify: false,
             prefer_ipv6: false,
+            basic_auth: None,
         }
     }
 }

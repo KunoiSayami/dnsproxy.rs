@@ -254,6 +254,7 @@ impl DohUpstream {
             Arc::new(tls_config),
             self.timeout,
             self.path.clone(),
+            self.basic_auth_header.clone(),
         ));
 
         *guard = Some(Arc::clone(&transport));

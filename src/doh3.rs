@@ -28,6 +28,7 @@ pub struct Http3Transport {
     tls_config: Arc<rustls::ClientConfig>,
     timeout: Option<Duration>,
     path: String,
+    basic_auth_header: Option<String>,
 
     inner: Mutex<Option<SendRequest<h3_quinn::OpenStreams, Bytes>>>,
 }
@@ -39,6 +40,7 @@ impl Http3Transport {
         tls_config: Arc<rustls::ClientConfig>,
         timeout: Option<Duration>,
         path: String,
+        basic_auth_header: Option<String>,
     ) -> Self {
         Self {
             server_addr,
@@ -46,6 +48,7 @@ impl Http3Transport {
             tls_config,
             timeout,
             path,
+            basic_auth_header,
             inner: Mutex::new(None),
         }
     }
@@ -98,9 +101,13 @@ impl Http3Transport {
             .parse()
             .map_err(|e| DohError::Http(format!("building request uri: {e}")))?;
 
-        let http_req = Request::get(uri)
+        let mut builder = Request::get(uri)
             .header(http::header::USER_AGENT, "")
-            .header(http::header::ACCEPT, "application/dns-message")
+            .header(http::header::ACCEPT, "application/dns-message");
+        if let Some(auth) = &self.basic_auth_header {
+            builder = builder.header(http::header::AUTHORIZATION, auth);
+        }
+        let http_req = builder
             .body(())
             .map_err(|e| DohError::Http(format!("building request: {e}")))?;
 

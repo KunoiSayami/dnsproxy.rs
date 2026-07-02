@@ -82,17 +82,23 @@ struct Args {
     #[arg(long, conflicts_with = "listen")]
     port: Option<u16>,
 
-    /// Path to an upstream config file, one rule per line. A line is either
-    /// a plain upstream (the default, used for anything not matched by a
-    /// domain rule) or `[/domain1/.../domainN/]upstream1 upstream2 ...` to
-    /// reserve upstreams for those domains and their subdomains, tried in
-    /// order on failure. Upstreams are DoH URLs, e.g.
-    /// https://dns.google/dns-query or h3://1.1.1.1/dns-query (HTTP/3-only),
-    /// optionally with HTTP Basic Auth userinfo
-    /// (https://user:pass@example.com/dns-query). Blank lines and lines
-    /// starting with # are ignored.
+    /// Upstream rule, same syntax as one line of --upstream-file: a plain
+    /// upstream (the default, used for anything not matched by a domain
+    /// rule) or `[/domain1/.../domainN/]upstream1 upstream2 ...` to reserve
+    /// upstreams for those domains and their subdomains, tried in order on
+    /// failure. Upstreams are DoH URLs, e.g. https://dns.google/dns-query or
+    /// h3://1.1.1.1/dns-query (HTTP/3-only), optionally with HTTP Basic Auth
+    /// userinfo (https://user:pass@example.com/dns-query). May be repeated;
+    /// combined with the rules from --upstream-file, if given. At least one
+    /// of --upstream or --upstream-file is required.
+    #[arg(short = 'u', long = "upstream")]
+    upstreams: Vec<String>,
+
+    /// Path to an upstream config file, one rule per line; see --upstream
+    /// for the line syntax. Blank lines and lines starting with # are
+    /// ignored.
     #[arg(long)]
-    upstream_file: PathBuf,
+    upstream_file: Option<PathBuf>,
 
     /// Overall timeout for exchanges, bootstrap lookups, and H3 probes, in seconds.
     #[arg(long, default_value_t = 10)]
@@ -236,20 +242,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let upstream_text = std::fs::read_to_string(&args.upstream_file)
-        .map_err(|e| format!("reading {}: {e}", args.upstream_file.display()))?;
-    let lines: Vec<&str> = upstream_text.lines().collect();
+    if args.upstreams.is_empty() && args.upstream_file.is_none() {
+        return Err("at least one of --upstream or --upstream-file is required".into());
+    }
+
+    let upstream_file_text = args
+        .upstream_file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
+        })
+        .transpose()?;
+    let lines: Vec<&str> = args
+        .upstreams
+        .iter()
+        .map(String::as_str)
+        .chain(upstream_file_text.iter().flat_map(|text| text.lines()))
+        .collect();
     let upstream_config = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {
         let joined = errs
             .iter()
             .map(|(idx, e)| format!("line {}: {e}", idx + 1))
             .collect::<Vec<_>>()
             .join("; ");
-        format!("parsing {}: {joined}", args.upstream_file.display())
+        format!("parsing upstreams: {joined}")
     })?;
 
     let listen_addrs = args.listen_addrs();
-    tracing::info!(listen = ?listen_addrs, upstream_file = %args.upstream_file.display(), "forwarding");
+    tracing::info!(listen = ?listen_addrs, upstream_file = ?args.upstream_file, "forwarding");
 
     let mut handler = Arc::new(upstream_config).into_handler();
     if args.cache {

@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
@@ -41,6 +41,7 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = "0.6"
+lru = "0.18"
 
 quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }

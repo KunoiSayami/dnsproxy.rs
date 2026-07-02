@@ -6,6 +6,7 @@
 //! to prefer it, matching the Go client's probing behavior.
 
 pub mod bootstrap;
+pub mod cache;
 pub mod doh;
 #[cfg(feature = "http3")]
 pub mod doh3;
@@ -14,6 +15,7 @@ pub mod options;
 pub mod server;
 pub mod wire;
 
+pub use cache::{Cache, CacheOptions};
 pub use doh::DohUpstream;
 pub use error::DohError;
 pub use options::{HttpVersion, Options};

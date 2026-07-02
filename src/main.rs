@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use hyper::Uri;
 
-use doh_upstream::{DohUpstream, HttpVersion, Options};
+use doh_upstream::{Cache, CacheOptions, DohUpstream, HttpVersion, Options};
 
 pub fn init_log(verbose: u8, default_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
@@ -89,6 +90,23 @@ struct Args {
     /// Default log level, used when RUST_LOG is unset.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Cache upstream responses in memory.
+    #[arg(long)]
+    cache: bool,
+
+    /// Maximum number of cached responses.
+    #[arg(long, default_value_t = 1000)]
+    cache_size: usize,
+
+    /// Floor applied to a cached response's TTL, in seconds.
+    #[arg(long, default_value_t = 0)]
+    cache_min_ttl: u64,
+
+    /// Ceiling applied to a cached response's TTL, in seconds. 0 means
+    /// unbounded.
+    #[arg(long, default_value_t = 0)]
+    cache_max_ttl: u64,
 }
 
 impl Args {
@@ -212,7 +230,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addrs = args.listen_addrs();
     tracing::info!(listen = ?listen_addrs, upstream = %upstream.address(), "forwarding");
 
-    let handler = upstream.into_handler();
+    let mut handler = upstream.into_handler();
+    if args.cache {
+        let cache_opts = CacheOptions {
+            size: NonZeroUsize::new(args.cache_size).ok_or("--cache-size must be nonzero")?,
+            min_ttl: Duration::from_secs(args.cache_min_ttl),
+            max_ttl: (args.cache_max_ttl > 0).then(|| Duration::from_secs(args.cache_max_ttl)),
+        };
+        tracing::info!(size = args.cache_size, "caching enabled");
+        handler = Arc::new(Cache::new(cache_opts)).into_handler(handler);
+    }
     doh_upstream::serve_all(&listen_addrs, handler).await?;
 
     // `serve` spawns its listeners and returns once bound; block forever so

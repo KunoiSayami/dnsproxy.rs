@@ -15,9 +15,43 @@ to prefer it, matching the Go client's probing behavior.
 - Configurable bootstrap resolver for resolving the DoH server's hostname
 - Automatic retry with a fresh client on retryable errors (timeouts, QUIC
   0-RTT rejection)
-- A minimal plain-DNS server (`serve`) that forwards UDP/TCP queries to any
-  async handler, so a `DohUpstream` can be turned into a local DNS-to-DoH
-  proxy with `into_handler`
+- Optional HTTP Basic Auth credentials sent with every upstream request
+- A minimal plain-DNS server (`serve`/`serve_all`) that forwards UDP/TCP
+  queries to any async handler, so a `DohUpstream` can be turned into a
+  local DNS-to-DoH proxy with `into_handler`, listening on one or more
+  addresses at once
+- An optional in-memory response cache (`Cache`), keyed by question name,
+  type, and class, with configurable TTL floor/ceiling and an LRU eviction
+  policy
+
+## Standalone binary
+
+The crate also builds a `doh-upstream` binary: a minimal standalone
+DNS-over-HTTPS forwarding proxy.
+
+```sh
+doh-upstream --upstream https://dns.google/dns-query --port 53
+```
+
+Useful flags:
+
+| Flag | Description |
+|---|---|
+| `--listen <addr>` | Address to listen on for plain DNS (UDP+TCP). Repeatable. |
+| `--port <port>` | Shorthand for listening on the IPv4 and IPv6 wildcard addresses on this port. |
+| `--upstream <url>` | Upstream DoH server URL. May embed HTTP Basic Auth as `user:pass@host`. |
+| `--timeout <secs>` | Overall timeout for exchanges, bootstrap lookups, and H3 probes (default `10`). |
+| `--insecure` | Disable TLS certificate verification. |
+| `--prefer-ipv6` | Prefer IPv6 addresses when the bootstrap resolves multiple families. |
+| `--http3` | Allow HTTP/3, in addition to HTTP/1.1 and HTTP/2 (requires the `http3` feature). |
+| `-v`, `--verbose` | Increase logging verbosity (repeatable). |
+| `--log-level <level>` | Default log level when `RUST_LOG` is unset (default `info`). |
+| `--cache` | Cache upstream responses in memory. |
+| `--cache-size <n>` | Maximum number of cached responses (default `1000`). |
+| `--cache-min-ttl <secs>` | Floor applied to a cached response's TTL (default `0`). |
+| `--cache-max-ttl <secs>` | Ceiling applied to a cached response's TTL; `0` means unbounded (default `0`). |
+
+Run `doh-upstream --help` for the full list.
 
 ## Usage
 
@@ -50,6 +84,18 @@ serve("127.0.0.1:5353".parse()?, upstream.into_handler()).await?;
 cargo check
 cargo test
 ```
+
+### Cross-compiling
+
+To build a static `aarch64-unknown-linux-musl` binary, install the target and
+an `aarch64-linux-musl-gcc` cross-toolchain, then build with `--release`:
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+cargo build --release --target aarch64-unknown-linux-musl
+```
+
+The linker for that target is configured in [.cargo/config.toml](.cargo/config.toml).
 
 ## License
 

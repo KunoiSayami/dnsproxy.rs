@@ -92,6 +92,15 @@ serve("127.0.0.1:5353".parse()?, upstream.into_handler()).await?;
 | Feature | Default | Description |
 |---|---|---|
 | `http3` | yes | Enables HTTP/3 support via `quinn`, `h3`, and `h3-quinn` |
+| `crypto-ring` | yes | Uses `ring` as rustls's crypto backend: pure Rust, no C toolchain, smaller binary |
+| `crypto-aws-lc-rs` | no | Uses `aws-lc-rs` instead: adds FIPS validation and post-quantum key exchange support, at the cost of a C/assembly build step and a larger binary |
+
+Exactly one of `crypto-ring`/`crypto-aws-lc-rs` must be enabled; the build
+fails at compile time otherwise. To switch backends:
+
+```sh
+cargo build --release --no-default-features --features http3,crypto-aws-lc-rs
+```
 
 ## Building
 

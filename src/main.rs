@@ -8,6 +8,28 @@ use clap::Parser;
 
 use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig};
 
+#[cfg(all(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
+compile_error!(
+    "features \"crypto-ring\" and \"crypto-aws-lc-rs\" are mutually exclusive; enable exactly one"
+);
+#[cfg(not(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs")))]
+compile_error!("exactly one of \"crypto-ring\" or \"crypto-aws-lc-rs\" must be enabled");
+
+/// Installs the process-wide rustls `CryptoProvider` selected at compile
+/// time via the `crypto-ring`/`crypto-aws-lc-rs` features. rustls needs this
+/// installed before any TLS connection is made; the lib crate leaves this to
+/// its consumer.
+fn install_crypto_provider() {
+    #[cfg(feature = "crypto-ring")]
+    let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+    #[cfg(feature = "crypto-aws-lc-rs")]
+    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+
+    provider
+        .install_default()
+        .expect("no CryptoProvider installed yet");
+}
+
 pub fn init_log(verbose: u8, default_level: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -139,11 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     init_log(args.verbose, &args.log_level);
 
-    // rustls needs a process-wide CryptoProvider installed before any TLS
-    // connection is made; the lib crate leaves this to its consumer.
-    tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("no CryptoProvider installed yet");
+    install_crypto_provider();
 
     #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
     let mut http_versions = vec![HttpVersion::Http11, HttpVersion::Http2];

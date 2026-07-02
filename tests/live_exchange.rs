@@ -65,7 +65,10 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
 }
 
 async fn start_server() -> SocketAddr {
+    #[cfg(feature = "crypto-ring")]
     let _ = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(feature = "crypto-aws-lc-rs")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let (cert_der, key_der) = generate_self_signed();
 

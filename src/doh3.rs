@@ -104,6 +104,13 @@ impl Http3Transport {
             .body(())
             .map_err(|e| DohError::Http(format!("building request: {e}")))?;
 
+        tracing::debug!(
+            server_name = %self.server_name,
+            id = original_id,
+            questions = ?req.queries(),
+            "sending doh request over http/3"
+        );
+
         let fut = async {
             let mut stream = sender
                 .send_request(http_req)

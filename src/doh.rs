@@ -195,7 +195,12 @@ impl DohUpstream {
             .body(Empty::<Bytes>::new())
             .map_err(|e| DohError::Http(format!("building request: {e}")))?;
 
-        tracing::trace!(addr = %self.addr_redacted, id = original_id, "sending doh request");
+        tracing::debug!(
+            addr = %self.addr_redacted,
+            id = original_id,
+            questions = ?req.queries(),
+            "sending doh request"
+        );
 
         let fut = client.request(http_req);
         let resp = match self.timeout {

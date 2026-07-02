@@ -7,6 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 use crate::error::DohError;
@@ -60,6 +63,95 @@ pub struct StaticResolver(pub Vec<IpAddr>);
 impl Resolver for StaticResolver {
     async fn lookup(&self, _host: &str) -> Result<Vec<IpAddr>, DohError> {
         Ok(self.0.clone())
+    }
+}
+
+/// Resolves via plain DNS-over-UDP against a fixed upstream server, for use
+/// as a custom bootstrap resolver (e.g. `--bootstrap 1.1.1.1:53`).
+pub struct PlainResolver {
+    addr: SocketAddr,
+    timeout: Option<Duration>,
+}
+
+impl PlainResolver {
+    pub fn new(addr: SocketAddr, timeout: Option<Duration>) -> Self {
+        Self { addr, timeout }
+    }
+
+    async fn query(&self, host: &str, qtype: RecordType) -> Result<Vec<IpAddr>, DohError> {
+        let name = Name::from_ascii(host).map_err(|e| DohError::Bootstrap(e.to_string()))?;
+        let mut msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(name, qtype));
+        let req_bytes = msg
+            .to_bytes()
+            .map_err(|e| DohError::Bootstrap(e.to_string()))?;
+
+        let fut = async {
+            let local = if self.addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let sock = UdpSocket::bind(local)
+                .await
+                .map_err(|e| DohError::Bootstrap(e.to_string()))?;
+            sock.connect(self.addr)
+                .await
+                .map_err(|e| DohError::Bootstrap(e.to_string()))?;
+            sock.send(&req_bytes)
+                .await
+                .map_err(|e| DohError::Bootstrap(e.to_string()))?;
+
+            let mut buf = [0u8; 4096];
+            let n = sock
+                .recv(&mut buf)
+                .await
+                .map_err(|e| DohError::Bootstrap(e.to_string()))?;
+
+            let resp =
+                Message::from_bytes(&buf[..n]).map_err(|e| DohError::Bootstrap(e.to_string()))?;
+            Ok(resp
+                .answers
+                .iter()
+                .filter_map(|rec| rec.data.ip_addr())
+                .collect::<Vec<IpAddr>>())
+        };
+
+        match self.timeout {
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                DohError::Bootstrap(format!("resolving {host} via {}: timed out", self.addr))
+            })?,
+            None => fut.await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Resolver for PlainResolver {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, DohError> {
+        let (a, aaaa) = tokio::join!(
+            self.query(host, RecordType::A),
+            self.query(host, RecordType::AAAA)
+        );
+
+        let mut ips = Vec::new();
+        let mut last_err = None;
+        match a {
+            Ok(addrs) => ips.extend(addrs),
+            Err(e) => last_err = Some(e),
+        }
+        match aaaa {
+            Ok(addrs) => ips.extend(addrs),
+            Err(e) => last_err = Some(e),
+        }
+
+        if ips.is_empty()
+            && let Some(e) = last_err
+        {
+            return Err(e);
+        }
+        Ok(ips)
     }
 }
 
@@ -217,6 +309,45 @@ mod tests {
         let resolver = StaticResolver(vec![ip]);
         let addrs = resolver.lookup("ignored.example.").await.unwrap();
         assert_eq!(addrs, vec![ip]);
+    }
+
+    #[tokio::test]
+    async fn plain_resolver_queries_udp_server() {
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let want_ip: IpAddr = "192.0.2.42".parse().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let (n, peer) = match server.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let req = Message::from_bytes(&buf[..n]).unwrap();
+                let mut resp = Message::new(req.metadata.id, MessageType::Response, OpCode::Query);
+                resp.add_query(req.queries[0].clone());
+                if req.queries[0].query_type() == RecordType::A {
+                    resp.add_answer(Record::from_rdata(
+                        req.queries[0].name().clone(),
+                        60,
+                        RData::A(A(match want_ip {
+                            IpAddr::V4(v4) => v4,
+                            _ => unreachable!(),
+                        })),
+                    ));
+                }
+                let bytes = resp.to_bytes().unwrap();
+                let _ = server.send_to(&bytes, peer).await;
+            }
+        });
+
+        let resolver = PlainResolver::new(server_addr, Some(Duration::from_secs(2)));
+        let addrs = resolver.lookup("example.com.").await.unwrap();
+        assert_eq!(addrs, vec![want_ip]);
     }
 
     #[tokio::test]

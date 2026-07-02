@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use doh_upstream::bootstrap::{ParallelResolver, PlainResolver};
 use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig};
 
 #[cfg(all(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
@@ -97,6 +98,14 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     timeout: u64,
 
+    /// Plain DNS server(s) used to resolve upstream hostnames, e.g.
+    /// --bootstrap 1.1.1.1 --bootstrap [2606:4700:4700::1111]:53. Port
+    /// defaults to 53 if omitted. May be repeated; queried in parallel, with
+    /// the first successful, non-empty result used. Defaults to the system
+    /// resolver if omitted.
+    #[arg(long, value_parser = parse_bootstrap_addr)]
+    bootstrap: Vec<SocketAddr>,
+
     /// Disable TLS certificate verification. Dangerous.
     #[arg(long)]
     insecure: bool,
@@ -137,6 +146,19 @@ struct Args {
     cache_max_ttl: u64,
 }
 
+/// Parses a `--bootstrap` value as a `SocketAddr`, defaulting the port to 53
+/// when omitted (e.g. `1.1.1.1` or `2606:4700:4700::1111`, in addition to
+/// `1.1.1.1:53` or `[2606:4700:4700::1111]:53`).
+fn parse_bootstrap_addr(s: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+    Err(format!("invalid bootstrap address: {s}"))
+}
+
 impl Args {
     /// Resolves the effective set of addresses to listen on: `--listen`
     /// verbatim (possibly repeated), `--port` expanded to the IPv4 and IPv6
@@ -170,9 +192,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_versions.push(HttpVersion::Http3);
     }
 
+    let timeout = Some(Duration::from_secs(args.timeout));
+    let bootstrap = (!args.bootstrap.is_empty()).then(|| {
+        let resolvers = args
+            .bootstrap
+            .iter()
+            .map(|addr| Arc::new(PlainResolver::new(*addr, timeout)) as Arc<_>)
+            .collect();
+        Arc::new(ParallelResolver(resolvers)) as Arc<_>
+    });
+
     let base_opts = Options {
+        bootstrap,
         http_versions,
-        timeout: Some(Duration::from_secs(args.timeout)),
+        timeout,
         insecure_skip_verify: args.insecure,
         prefer_ipv6: args.prefer_ipv6,
         ..Default::default()

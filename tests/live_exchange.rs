@@ -31,7 +31,7 @@ fn generate_self_signed() -> (
 ) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = cert.cert.der().clone();
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
     (cert_der, key_der)
 }
 
@@ -45,20 +45,15 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
     let raw = URL_SAFE_NO_PAD.decode(dns_param).expect("valid base64url");
     let query_msg = Message::from_bytes(&raw).expect("valid dns message");
     assert_eq!(
-        query_msg.id(),
-        0,
+        query_msg.metadata.id, 0,
         "RFC 8484 requires a zeroed id in the request"
     );
 
-    let mut resp = Message::new();
-    resp.set_id(0);
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.add_query(query_msg.queries()[0].clone());
+    let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
+    resp.add_query(query_msg.queries[0].clone());
 
-    let name = query_msg.queries()[0].name().clone();
-    let mut record = Record::with(name, RecordType::A, 60);
-    record.set_data(Some(RData::A(A::new(93, 184, 216, 34))));
+    let name = query_msg.queries[0].name().clone();
+    let record = Record::from_rdata(name, 60, RData::A(A::new(93, 184, 216, 34)));
     resp.add_answer(record);
 
     let body = resp.to_bytes().unwrap();
@@ -119,10 +114,7 @@ async fn exchange_roundtrips_over_local_https_server() {
 
     let upstream = DohUpstream::new("localhost", Some(addr.port()), "/dns-query", opts);
 
-    let mut msg = Message::new();
-    msg.set_id(0xBEEF);
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
+    let mut msg = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
     msg.add_query(Query::query(
         Name::from_str("example.com.").unwrap(),
         RecordType::A,
@@ -133,6 +125,9 @@ async fn exchange_roundtrips_over_local_https_server() {
         .await
         .expect("exchange should succeed");
 
-    assert_eq!(resp.id(), 0xBEEF, "original request id must be restored");
-    assert_eq!(resp.answers().len(), 1);
+    assert_eq!(
+        resp.metadata.id, 0xBEEF,
+        "original request id must be restored"
+    );
+    assert_eq!(resp.answers.len(), 1);
 }

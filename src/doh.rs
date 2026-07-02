@@ -198,7 +198,7 @@ impl DohUpstream {
         tracing::debug!(
             addr = %self.addr_redacted,
             id = original_id,
-            questions = ?req.queries(),
+            questions = ?req.queries,
             "sending doh request"
         );
 

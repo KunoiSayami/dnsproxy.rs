@@ -107,7 +107,7 @@ impl Http3Transport {
         tracing::debug!(
             server_name = %self.server_name,
             id = original_id,
-            questions = ?req.queries(),
+            questions = ?req.queries,
             "sending doh request over http/3"
         );
 

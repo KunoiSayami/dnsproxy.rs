@@ -133,10 +133,7 @@ async fn handle_udp_packet(
     if bytes.len() > UDP_MAX_MSG_SIZE {
         // Truncate per RFC 1035: signal TC and drop all sections, leaving
         // just the question, so the client retries over TCP.
-        resp.set_truncated(true);
-        resp.take_answers();
-        resp.take_name_servers();
-        resp.take_additionals();
+        resp = resp.truncate();
         bytes = resp.to_bytes()?;
     }
 

@@ -6,7 +6,7 @@ pub enum DohError {
     Bootstrap(String),
 
     #[error("packing dns message: {0}")]
-    Pack(#[from] hickory_proto::error::ProtoError),
+    Pack(#[from] hickory_proto::ProtoError),
 
     #[error("http request failed: {0}")]
     Http(String),

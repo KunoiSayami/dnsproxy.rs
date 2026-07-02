@@ -32,7 +32,7 @@ fn generate_self_signed() -> (
 ) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = cert.cert.der().clone();
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
     (cert_der, key_der)
 }
 
@@ -46,15 +46,11 @@ async fn handle_doh(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyp
     let raw = URL_SAFE_NO_PAD.decode(dns_param).expect("valid base64url");
     let query_msg = Message::from_bytes(&raw).expect("valid dns message");
 
-    let mut resp = Message::new();
-    resp.set_id(0);
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.add_query(query_msg.queries()[0].clone());
+    let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
+    resp.add_query(query_msg.queries[0].clone());
 
-    let name = query_msg.queries()[0].name().clone();
-    let mut record = Record::with(name, RecordType::A, 60);
-    record.set_data(Some(RData::A(A::new(93, 184, 216, 34))));
+    let name = query_msg.queries[0].name().clone();
+    let record = Record::from_rdata(name, 60, RData::A(A::new(93, 184, 216, 34)));
     resp.add_answer(record);
 
     let body = resp.to_bytes().unwrap();
@@ -103,11 +99,8 @@ async fn start_doh_server() -> SocketAddr {
 }
 
 fn make_query(id: u16, name: &str) -> Message {
-    let mut msg = Message::new();
-    msg.set_id(id);
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
-    msg.set_recursion_desired(true);
+    let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
     msg
 }
@@ -165,8 +158,8 @@ async fn udp_query_is_forwarded_and_answered() {
     .unwrap();
 
     let resp = Message::from_bytes(&buf[..n]).unwrap();
-    assert_eq!(resp.id(), 0x1234);
-    assert_eq!(resp.answers().len(), 1);
+    assert_eq!(resp.metadata.id, 0x1234);
+    assert_eq!(resp.answers.len(), 1);
 }
 
 #[tokio::test]
@@ -189,6 +182,6 @@ async fn tcp_query_is_forwarded_and_answered() {
     stream.read_exact(&mut buf).await.unwrap();
 
     let resp = Message::from_bytes(&buf).unwrap();
-    assert_eq!(resp.id(), 0x5678);
-    assert_eq!(resp.answers().len(), 1);
+    assert_eq!(resp.metadata.id, 0x5678);
+    assert_eq!(resp.answers.len(), 1);
 }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use doh_upstream::bootstrap::{ParallelResolver, PlainResolver};
-use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig};
+use doh_upstream::bootstrap::{DohResolver, ParallelResolver, PlainResolver, Resolver};
+use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig, parse_upstream};
 
 #[cfg(all(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
 compile_error!(
@@ -98,13 +98,14 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     timeout: u64,
 
-    /// Plain DNS server(s) used to resolve upstream hostnames, e.g.
-    /// --bootstrap 1.1.1.1 --bootstrap [2606:4700:4700::1111]:53. Port
-    /// defaults to 53 if omitted. May be repeated; queried in parallel, with
-    /// the first successful, non-empty result used. Defaults to the system
-    /// resolver if omitted.
-    #[arg(long, value_parser = parse_bootstrap_addr)]
-    bootstrap: Vec<SocketAddr>,
+    /// Server(s) used to resolve upstream hostnames: a plain DNS address
+    /// (e.g. --bootstrap 1.1.1.1, port defaults to 53) or a DoH/DoH3 URL
+    /// with a literal IP host (e.g. --bootstrap https://1.1.1.1/dns-query
+    /// or --bootstrap h3://1.1.1.1/dns-query). May be repeated; queried in
+    /// parallel, with the first successful, non-empty result used. Defaults
+    /// to the system resolver if omitted.
+    #[arg(long)]
+    bootstrap: Vec<String>,
 
     /// Disable TLS certificate verification. Dangerous.
     #[arg(long)]
@@ -146,15 +147,30 @@ struct Args {
     cache_max_ttl: u64,
 }
 
-/// Parses a `--bootstrap` value as a `SocketAddr`, defaulting the port to 53
+/// Builds the [`Resolver`] for one `--bootstrap` value: a DoH/DoH3 URL
+/// (`https://`/`h3://`, with a literal IP host, since it has no bootstrap
+/// resolver of its own) or a plain DNS address, defaulting its port to 53
 /// when omitted (e.g. `1.1.1.1` or `2606:4700:4700::1111`, in addition to
 /// `1.1.1.1:53` or `[2606:4700:4700::1111]:53`).
-fn parse_bootstrap_addr(s: &str) -> Result<SocketAddr, String> {
+fn parse_bootstrap(s: &str, doh_opts: &Options) -> Result<Arc<dyn Resolver>, String> {
+    if s.contains("://") {
+        let upstream = parse_upstream(s, doh_opts)?;
+        if upstream.host().parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "bootstrap {s:?} must use a literal IP host, not a hostname"
+            ));
+        }
+        return Ok(Arc::new(DohResolver(upstream)));
+    }
+
     if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(Arc::new(PlainResolver::new(addr, doh_opts.timeout)));
     }
     if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, 53));
+        return Ok(Arc::new(PlainResolver::new(
+            SocketAddr::new(ip, 53),
+            doh_opts.timeout,
+        )));
     }
     Err(format!("invalid bootstrap address: {s}"))
 }
@@ -193,14 +209,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let timeout = Some(Duration::from_secs(args.timeout));
-    let bootstrap = (!args.bootstrap.is_empty()).then(|| {
-        let resolvers = args
-            .bootstrap
-            .iter()
-            .map(|addr| Arc::new(PlainResolver::new(*addr, timeout)) as Arc<_>)
-            .collect();
-        Arc::new(ParallelResolver(resolvers)) as Arc<_>
-    });
+    let bootstrap_opts = Options {
+        http_versions: http_versions.clone(),
+        timeout,
+        insecure_skip_verify: args.insecure,
+        prefer_ipv6: args.prefer_ipv6,
+        ..Default::default()
+    };
+    let bootstrap = (!args.bootstrap.is_empty())
+        .then(|| {
+            let resolvers = args
+                .bootstrap
+                .iter()
+                .map(|s| parse_bootstrap(s, &bootstrap_opts))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, String>(Arc::new(ParallelResolver(resolvers)) as Arc<dyn Resolver>)
+        })
+        .transpose()?;
 
     let base_opts = Options {
         bootstrap,

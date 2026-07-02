@@ -56,7 +56,7 @@ Useful flags:
 | `--port <port>` | Shorthand for listening on the IPv4 and IPv6 wildcard addresses on this port. |
 | `--upstream-file <path>` | Path to an upstream config file (see above). Upstreams are DoH URLs (`https://`, or `h3://` for HTTP/3-only), optionally with HTTP Basic Auth as `user:pass@host`. |
 | `--timeout <secs>` | Overall timeout for exchanges, bootstrap lookups, and H3 probes (default `10`). |
-| `--bootstrap <addr>` | Plain DNS server used to resolve upstream hostnames, e.g. `1.1.1.1` or `[2606:4700:4700::1111]:53` (port defaults to `53`). Repeatable; queried in parallel. Defaults to the system resolver. |
+| `--bootstrap <addr>` | Server used to resolve upstream hostnames: a plain DNS address, e.g. `1.1.1.1` or `[2606:4700:4700::1111]:53` (port defaults to `53`), or a DoH/DoH3 URL with a literal IP host, e.g. `https://1.1.1.1/dns-query` (`h3://` requires `--http3`). Repeatable; queried in parallel. Defaults to the system resolver. |
 | `--insecure` | Disable TLS certificate verification. |
 | `--prefer-ipv6` | Prefer IPv6 addresses when the bootstrap resolves multiple families. |
 | `--http3` | Allow HTTP/3, in addition to HTTP/1.1 and HTTP/2 (requires the `http3` feature). |

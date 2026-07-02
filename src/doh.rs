@@ -70,6 +70,12 @@ impl DohUpstream {
         }
     }
 
+    /// The upstream's host, as given to [`Self::new`] (no scheme, port, or
+    /// path).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn address(&self) -> &str {
         &self.addr_redacted
     }

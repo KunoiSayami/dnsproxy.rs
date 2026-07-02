@@ -12,6 +12,7 @@ use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
+use crate::doh::DohUpstream;
 use crate::error::DohError;
 
 /// Network type used when dialing.
@@ -155,6 +156,56 @@ impl Resolver for PlainResolver {
     }
 }
 
+/// Resolves via a DoH/DoH3 upstream, for use as a custom bootstrap resolver
+/// pointed at a DNS-over-HTTPS server (e.g. `--bootstrap
+/// https://1.1.1.1/dns-query`). The wrapped upstream's own host must be a
+/// literal IP, since it has no bootstrap resolver of its own to fall back on.
+pub struct DohResolver(pub Arc<DohUpstream>);
+
+impl DohResolver {
+    async fn query(&self, host: &str, qtype: RecordType) -> Result<Vec<IpAddr>, DohError> {
+        let name = Name::from_ascii(host).map_err(|e| DohError::Bootstrap(e.to_string()))?;
+        let mut msg = Message::new(rand::random(), MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(name, qtype));
+
+        let resp = self.0.exchange(&msg).await?;
+        Ok(resp
+            .answers
+            .iter()
+            .filter_map(|rec| rec.data.ip_addr())
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl Resolver for DohResolver {
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, DohError> {
+        let (a, aaaa) = tokio::join!(
+            self.query(host, RecordType::A),
+            self.query(host, RecordType::AAAA)
+        );
+
+        let mut ips = Vec::new();
+        let mut last_err = None;
+        match a {
+            Ok(addrs) => ips.extend(addrs),
+            Err(e) => last_err = Some(e),
+        }
+        match aaaa {
+            Ok(addrs) => ips.extend(addrs),
+            Err(e) => last_err = Some(e),
+        }
+
+        if ips.is_empty()
+            && let Some(e) = last_err
+        {
+            return Err(e);
+        }
+        Ok(ips)
+    }
+}
+
 /// Queries all resolvers concurrently and returns the first successful,
 /// non-empty result.
 pub struct ParallelResolver(pub Vec<Arc<dyn Resolver>>);
@@ -272,12 +323,16 @@ pub async fn resolve_dial_context(
     resolver: &dyn Resolver,
     prefer_v6: bool,
 ) -> Result<DialHandler, DohError> {
-    let lookup = resolver.lookup(host);
-    let ips = match timeout {
-        Some(d) => tokio::time::timeout(d, lookup)
-            .await
-            .map_err(|_| DohError::Bootstrap(format!("resolving {host}: timed out")))??,
-        None => lookup.await?,
+    let ips = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else {
+        let lookup = resolver.lookup(host);
+        match timeout {
+            Some(d) => tokio::time::timeout(d, lookup)
+                .await
+                .map_err(|_| DohError::Bootstrap(format!("resolving {host}: timed out")))??,
+            None => lookup.await?,
+        }
     };
 
     if ips.is_empty() {
@@ -309,6 +364,32 @@ mod tests {
         let resolver = StaticResolver(vec![ip]);
         let addrs = resolver.lookup("ignored.example.").await.unwrap();
         assert_eq!(addrs, vec![ip]);
+    }
+
+    #[tokio::test]
+    async fn resolve_dial_context_skips_resolver_for_literal_ip() {
+        struct Unreachable;
+        #[async_trait::async_trait]
+        impl Resolver for Unreachable {
+            async fn lookup(&self, _host: &str) -> Result<Vec<IpAddr>, DohError> {
+                panic!("resolver should not be called for a literal IP host");
+            }
+        }
+
+        // Bind an ephemeral listener and dial it by its literal IP to prove
+        // resolve_dial_context used the address as-is rather than routing it
+        // through `Unreachable` (which would panic).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let handler = resolve_dial_context("127.0.0.1", port, None, &Unreachable, false)
+            .await
+            .unwrap();
+        let conn = (handler)(Network::Tcp).await;
+        assert!(conn.is_ok());
     }
 
     #[tokio::test]

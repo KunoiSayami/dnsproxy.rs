@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -32,9 +33,14 @@ pub type Handler = Arc<
 /// `handler` and writing back whatever it returns. Runs until the process is
 /// killed or a fatal socket error occurs; both loops are spawned and this
 /// function returns once both listeners are bound.
+///
+/// IPv6 addresses are bound with `IPV6_V6ONLY` set, so that binding an IPv6
+/// wildcard address (e.g. `[::]:53`) doesn't claim the IPv4 wildcard address
+/// on platforms where dual-stack sockets are the default, and a caller can
+/// bind both families on the same port via [`serve_all`].
 pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
-    let udp = UdpSocket::bind(addr).await?;
-    let tcp = TcpListener::bind(addr).await?;
+    let udp = bind_udp(addr)?;
+    let tcp = bind_tcp(addr)?;
     tracing::info!(%addr, "listening for udp and tcp dns queries");
 
     let udp_handler = Arc::clone(&handler);
@@ -47,6 +53,44 @@ pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
     });
 
     Ok(())
+}
+
+/// Runs [`serve`] on every address in `addrs`, so a caller can e.g. bind both
+/// an IPv4 and an IPv6 wildcard address for the same port.
+pub async fn serve_all(addrs: &[SocketAddr], handler: Handler) -> Result<(), DohError> {
+    for &addr in addrs {
+        serve(addr, Arc::clone(&handler)).await?;
+    }
+    Ok(())
+}
+
+/// Builds a `socket2::Socket` for `addr`, setting `IPV6_V6ONLY` on IPv6
+/// sockets so IPv4 and IPv6 wildcard binds don't collide.
+fn new_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Socket> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, ty, Some(protocol))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = new_socket(addr, Type::DGRAM, Protocol::UDP)?;
+    UdpSocket::from_std(socket.into())
+}
+
+fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 async fn udp_loop(socket: UdpSocket, handler: Handler) {

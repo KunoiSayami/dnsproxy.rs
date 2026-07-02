@@ -17,4 +17,4 @@ pub mod wire;
 pub use doh::DohUpstream;
 pub use error::DohError;
 pub use options::{HttpVersion, Options};
-pub use server::{Handler, serve};
+pub use server::{Handler, serve, serve_all};

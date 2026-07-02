@@ -22,12 +22,14 @@ pub fn init_log(verbose: u8, default_level: &str) {
     if verbose < 3 {
         filter = filter
             .add_directive("h2::codec=warn".parse().unwrap())
-            .add_directive("hpack=warn".parse().unwrap())
+            .add_directive("h2::hpack=warn".parse().unwrap())
             .add_directive("h2::client=warn".parse().unwrap());
     }
     if verbose < 2 {
         filter = filter
             .add_directive("hyper_util::client=warn".parse().unwrap())
+            .add_directive("hickory_proto=warn".parse().unwrap())
+            .add_directive("rustls=warn".parse().unwrap())
             .add_directive("h2::frame=warn".parse().unwrap());
     }
     if verbose < 1 {
@@ -45,9 +47,16 @@ pub fn init_log(verbose: u8, default_level: &str) {
 /// A minimal standalone DNS-over-HTTPS forwarding proxy.
 #[derive(Parser)]
 struct Args {
-    /// Address to listen on for plain DNS (UDP and TCP).
-    #[arg(long, default_value = "127.0.0.1:53")]
-    listen: SocketAddr,
+    /// Address to listen on for plain DNS (UDP and TCP). May be repeated to
+    /// bind multiple addresses, e.g. --listen 0.0.0.0:53 --listen [::]:53.
+    #[arg(long, conflicts_with = "port")]
+    listen: Vec<SocketAddr>,
+
+    /// Listen on this port for plain DNS (UDP and TCP), on both the IPv4 and
+    /// IPv6 wildcard addresses (0.0.0.0 and [::]). Shorthand for
+    /// --listen 0.0.0.0:<port> --listen [::]:<port>.
+    #[arg(long, conflicts_with = "listen")]
+    port: Option<u16>,
 
     /// Upstream DoH server, e.g. https://dns.google/dns-query. May include
     /// HTTP Basic Auth credentials as userinfo, e.g.
@@ -80,6 +89,25 @@ struct Args {
     /// Default log level, used when RUST_LOG is unset.
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+impl Args {
+    /// Resolves the effective set of addresses to listen on: `--listen`
+    /// verbatim (possibly repeated), `--port` expanded to the IPv4 and IPv6
+    /// wildcard addresses, or the default of `127.0.0.1:53` when neither was
+    /// given.
+    fn listen_addrs(&self) -> Vec<SocketAddr> {
+        if let Some(port) = self.port {
+            return vec![
+                SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
+                SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port),
+            ];
+        }
+        if !self.listen.is_empty() {
+            return self.listen.clone();
+        }
+        vec![SocketAddr::from(([127, 0, 0, 1], 53))]
+    }
 }
 
 /// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
@@ -181,10 +209,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &path,
         opts,
     ));
-    tracing::info!(listen = %args.listen, upstream = %upstream.address(), "forwarding");
+    let listen_addrs = args.listen_addrs();
+    tracing::info!(listen = ?listen_addrs, upstream = %upstream.address(), "forwarding");
 
     let handler = upstream.into_handler();
-    doh_upstream::serve(args.listen, handler).await?;
+    doh_upstream::serve_all(&listen_addrs, handler).await?;
 
     // `serve` spawns its listeners and returns once bound; block forever so
     // the process keeps running them.

@@ -313,16 +313,17 @@ async fn dial_one(
     }
 }
 
-/// Resolves `host` (the DoH server's hostname) via `resolver`, then returns a
-/// [`DialHandler`] bound to those resolved addresses, sorted to prefer IPv4
-/// or IPv6 per `prefer_v6`. Mirrors `bootstrap.ResolveDialContext`.
-pub async fn resolve_dial_context(
+/// Resolves `host` (the DoH server's hostname) via `resolver` (skipped when
+/// `host` is already a literal IP), returning addresses on `port` sorted to
+/// prefer IPv4 or IPv6 per `prefer_v6`. Mirrors the resolution half of
+/// `bootstrap.ResolveDialContext`.
+pub async fn resolve_addrs(
     host: &str,
     port: u16,
     timeout: Option<Duration>,
     resolver: &dyn Resolver,
     prefer_v6: bool,
-) -> Result<DialHandler, DohError> {
+) -> Result<Vec<SocketAddr>, DohError> {
     let ips = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![ip]
     } else {
@@ -346,11 +347,23 @@ pub async fn resolve_dial_context(
         if prefer_v6 { !is_v6 } else { is_v6 }
     });
 
-    let addrs = ips
+    Ok(ips
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
-        .collect();
+        .collect())
+}
 
+/// Resolves `host` (the DoH server's hostname) via `resolver`, then returns a
+/// [`DialHandler`] bound to those resolved addresses, sorted to prefer IPv4
+/// or IPv6 per `prefer_v6`. Mirrors `bootstrap.ResolveDialContext`.
+pub async fn resolve_dial_context(
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+    resolver: &dyn Resolver,
+    prefer_v6: bool,
+) -> Result<DialHandler, DohError> {
+    let addrs = resolve_addrs(host, port, timeout, resolver, prefer_v6).await?;
     Ok(new_dial_context(timeout, addrs))
 }
 

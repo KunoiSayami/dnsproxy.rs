@@ -37,10 +37,15 @@ pub fn init_log(verbose: u8, default_level: &str) {
     let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
+    if verbose < 5 {
+        filter = filter.add_directive("quinn_proto::connection=warn".parse().unwrap());
+    }
+
     if verbose < 4 {
         filter = filter
             .add_directive("h2::proto=warn".parse().unwrap())
             .add_directive("rustls::client=warn".parse().unwrap())
+            .add_directive("quinn_proto=warn".parse().unwrap())
             .add_directive("rustls_platform_verifier=warn".parse().unwrap());
     }
     if verbose < 3 {

@@ -16,6 +16,8 @@ use tokio::sync::Mutex;
 
 use hickory_proto::op::Message;
 
+#[cfg(feature = "http3")]
+use crate::bootstrap::resolve_addrs;
 use crate::bootstrap::{Resolver, SystemResolver, resolve_dial_context};
 use crate::error::DohError;
 use crate::options::{HttpVersion, Options};
@@ -25,8 +27,10 @@ const DEFAULT_PORT_DOH: u16 = 443;
 const MAX_MSG_SIZE: usize = 65535;
 
 /// A DNS-over-HTTPS upstream client (RFC 8484), supporting HTTP/1.1 and
-/// HTTP/2 transports. Analogous to Go's `dnsOverHTTPS` minus the HTTP/3
-/// racing logic, which lives in [`crate::doh3`] behind the `http3` feature.
+/// HTTP/2 always, and HTTP/3 behind the `http3` feature: mirrors Go's
+/// `dnsOverHTTPS`, racing a QUIC handshake against TLS (via
+/// [`crate::doh3::probe_h3`]) to decide which to use, unless the upstream
+/// only advertises HTTP/3.
 pub struct DohUpstream {
     host: String,
     port: u16,
@@ -40,6 +44,14 @@ pub struct DohUpstream {
     basic_auth_header: Option<String>,
 
     client: Mutex<Option<Client<HttpsConnector, Empty<Bytes>>>>,
+    #[cfg(feature = "http3")]
+    h3: Mutex<Option<Arc<crate::doh3::Http3Transport>>>,
+    /// Cached result of racing HTTP/3 against HTTP/2 (mirrors Go caching
+    /// `probeH3`'s outcome on the upstream). `None` until the first
+    /// exchange; irrelevant when [`Self::http_versions`] names only one of
+    /// the two.
+    #[cfg(feature = "http3")]
+    prefer_h3: Mutex<Option<bool>>,
 }
 
 impl DohUpstream {
@@ -67,6 +79,10 @@ impl DohUpstream {
             insecure_skip_verify: opts.insecure_skip_verify,
             basic_auth_header,
             client: Mutex::new(None),
+            #[cfg(feature = "http3")]
+            h3: Mutex::new(None),
+            #[cfg(feature = "http3")]
+            prefer_h3: Mutex::new(None),
         }
     }
 
@@ -94,6 +110,11 @@ impl DohUpstream {
     /// client if the first attempt fails with a retryable error (mirrors
     /// `dnsOverHTTPS.Exchange`).
     pub async fn exchange(&self, req: &Message) -> Result<Message, DohError> {
+        #[cfg(feature = "http3")]
+        if self.should_use_http3().await? {
+            return self.exchange_h3(req).await;
+        }
+
         let (client, was_cached) = self.get_client().await?;
 
         match self.exchange_https(&client, req).await {
@@ -109,6 +130,13 @@ impl DohUpstream {
                 Err(e)
             }
         }
+    }
+
+    /// Whether HTTP/2 (or 1.1) is among this upstream's allowed versions,
+    /// i.e. whether the racing probe against HTTP/3 is meaningful at all.
+    #[cfg(feature = "http3")]
+    fn http2_supported(&self) -> bool {
+        self.http_versions.iter().any(|v| *v != HttpVersion::Http3)
     }
 
     async fn get_client(&self) -> Result<(Client<HttpsConnector, Empty<Bytes>>, bool), DohError> {
@@ -139,6 +167,97 @@ impl DohUpstream {
     async fn reset_client_ignore_err(&self) {
         let mut guard = self.client.lock().await;
         *guard = None;
+    }
+
+    #[cfg(feature = "http3")]
+    /// Decides whether to use HTTP/3 for this exchange: always true if it's
+    /// the only version this upstream allows, always false if it isn't
+    /// allowed at all, otherwise the cached (or freshly probed) result of
+    /// racing a QUIC handshake against TLS, mirroring `dnsOverHTTPS.exchangeHTTPSClient`.
+    async fn should_use_http3(&self) -> Result<bool, DohError> {
+        let allows_http3 = self.http_versions.contains(&HttpVersion::Http3);
+        if !allows_http3 {
+            return Ok(false);
+        }
+        if !self.http2_supported() {
+            return Ok(true);
+        }
+
+        if let Some(prefer) = *self.prefer_h3.lock().await {
+            return Ok(prefer);
+        }
+
+        let addrs = resolve_addrs(
+            &self.host,
+            self.port,
+            self.timeout,
+            self.resolver.as_ref(),
+            self.prefer_ipv6,
+        )
+        .await?;
+        let addr = *addrs
+            .first()
+            .ok_or_else(|| DohError::Bootstrap(format!("no addresses for {}", self.host)))?;
+
+        let tls_config =
+            build_tls_config(&self.host, self.insecure_skip_verify, vec![b"h2".to_vec()]);
+        let prefer =
+            crate::doh3::probe_h3(addr, &self.host, Arc::new(tls_config), self.timeout, true).await;
+
+        *self.prefer_h3.lock().await = Some(prefer);
+        Ok(prefer)
+    }
+
+    #[cfg(feature = "http3")]
+    async fn exchange_h3(&self, req: &Message) -> Result<Message, DohError> {
+        let (transport, was_cached) = self.get_h3_transport().await?;
+
+        match transport.exchange(req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if was_cached && e.should_retry() => {
+                tracing::debug!(addr = %self.addr_redacted, error = %e, "retrying http/3 with a fresh transport");
+                transport.reset().await?;
+                transport.exchange(req).await
+            }
+            Err(e) => {
+                tracing::warn!(addr = %self.addr_redacted, error = %e, "http/3 exchange failed");
+                *self.h3.lock().await = None;
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    async fn get_h3_transport(&self) -> Result<(Arc<crate::doh3::Http3Transport>, bool), DohError> {
+        let mut guard = self.h3.lock().await;
+        if let Some(t) = guard.as_ref() {
+            return Ok((Arc::clone(t), true));
+        }
+
+        let addrs = resolve_addrs(
+            &self.host,
+            self.port,
+            self.timeout,
+            self.resolver.as_ref(),
+            self.prefer_ipv6,
+        )
+        .await?;
+        let addr = *addrs
+            .first()
+            .ok_or_else(|| DohError::Bootstrap(format!("no addresses for {}", self.host)))?;
+
+        let tls_config =
+            build_tls_config(&self.host, self.insecure_skip_verify, vec![b"h3".to_vec()]);
+        let transport = Arc::new(crate::doh3::Http3Transport::new(
+            addr,
+            self.host.clone(),
+            Arc::new(tls_config),
+            self.timeout,
+            self.path.clone(),
+        ));
+
+        *guard = Some(Arc::clone(&transport));
+        Ok((transport, false))
     }
 
     async fn create_client(&self) -> Result<Client<HttpsConnector, Empty<Bytes>>, DohError> {

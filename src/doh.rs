@@ -93,10 +93,12 @@ impl DohUpstream {
         match self.exchange_https(&client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) if was_cached && e.should_retry() => {
+                tracing::debug!(addr = %self.addr_redacted, error = %e, "retrying with a fresh client");
                 let client = self.reset_client().await?;
                 self.exchange_https(&client, req).await
             }
             Err(e) => {
+                tracing::warn!(addr = %self.addr_redacted, error = %e, "exchange failed");
                 self.reset_client_ignore_err().await;
                 Err(e)
             }
@@ -134,6 +136,7 @@ impl DohUpstream {
     }
 
     async fn create_client(&self) -> Result<Client<HttpsConnector, Empty<Bytes>>, DohError> {
+        tracing::debug!(host = %self.host, port = self.port, "creating http client");
         let dial = resolve_dial_context(
             &self.host,
             self.port,
@@ -191,6 +194,8 @@ impl DohUpstream {
         let http_req = builder
             .body(Empty::<Bytes>::new())
             .map_err(|e| DohError::Http(format!("building request: {e}")))?;
+
+        tracing::trace!(addr = %self.addr_redacted, id = original_id, "sending doh request");
 
         let fut = client.request(http_req);
         let resp = match self.timeout {

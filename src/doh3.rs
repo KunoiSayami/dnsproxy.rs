@@ -51,6 +51,7 @@ impl Http3Transport {
     }
 
     async fn connect(&self) -> Result<SendRequest<h3_quinn::OpenStreams, Bytes>, DohError> {
+        tracing::debug!(addr = %self.server_addr, server_name = %self.server_name, "opening http/3 connection");
         let quic_conn = dial_quic(
             self.server_addr,
             &self.server_name,
@@ -214,15 +215,23 @@ pub async fn probe_h3(
 
     let race = async {
         tokio::select! {
-            (quic_ok, _) = quic_probe => quic_ok,
-            (tls_ok, _) = tls_probe => !tls_ok,
+            (quic_ok, elapsed) = quic_probe => {
+                tracing::debug!(%addr, server_name, quic_ok, ?elapsed, "quic probe won the race");
+                quic_ok
+            }
+            (tls_ok, elapsed) = tls_probe => {
+                tracing::debug!(%addr, server_name, tls_ok, ?elapsed, "tls probe won the race");
+                !tls_ok
+            }
         }
     };
 
-    match timeout {
+    let prefer_h3 = match timeout {
         Some(t) => tokio::time::timeout(t, race).await.unwrap_or(false),
         None => race.await,
-    }
+    };
+    tracing::debug!(%addr, server_name, prefer_h3, "http/3 probe result");
+    prefer_h3
 }
 
 async fn probe_tls(addr: SocketAddr, server_name: &str) -> Result<(), DohError> {

@@ -35,6 +35,7 @@ pub type Handler = Arc<
 pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
     let udp = UdpSocket::bind(addr).await?;
     let tcp = TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "listening for udp and tcp dns queries");
 
     let udp_handler = Arc::clone(&handler);
     tokio::spawn(async move {
@@ -55,7 +56,10 @@ async fn udp_loop(socket: UdpSocket, handler: Handler) {
     loop {
         let (len, peer) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "udp recv failed");
+                continue;
+            }
         };
 
         let packet = buf[..len].to_vec();
@@ -63,7 +67,9 @@ async fn udp_loop(socket: UdpSocket, handler: Handler) {
         let handler = Arc::clone(&handler);
 
         tokio::spawn(async move {
-            let _ = handle_udp_packet(&socket, &packet, peer, handler).await;
+            if let Err(e) = handle_udp_packet(&socket, &packet, peer, handler).await {
+                tracing::warn!(%peer, error = %e, "udp query failed");
+            }
         });
     }
 }
@@ -96,13 +102,18 @@ async fn handle_udp_packet(
 
 async fn tcp_loop(listener: TcpListener, handler: Handler) {
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "tcp accept failed");
+                continue;
+            }
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            let _ = handle_tcp_connection(stream, handler).await;
+            if let Err(e) = handle_tcp_connection(stream, handler).await {
+                tracing::warn!(%peer, error = %e, "tcp connection failed");
+            }
         });
     }
 }

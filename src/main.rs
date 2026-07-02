@@ -7,6 +7,41 @@ use hyper::Uri;
 
 use doh_upstream::{DohUpstream, HttpVersion, Options};
 
+pub fn init_log(verbose: u8, default_level: &str) {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let mut filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    if verbose < 4 {
+        filter = filter
+            .add_directive("h2::proto=warn".parse().unwrap())
+            .add_directive("rustls::client=warn".parse().unwrap())
+            .add_directive("rustls_platform_verifier=warn".parse().unwrap());
+    }
+    if verbose < 3 {
+        filter = filter
+            .add_directive("h2::codec=warn".parse().unwrap())
+            .add_directive("hpack=warn".parse().unwrap())
+            .add_directive("h2::client=warn".parse().unwrap());
+    }
+    if verbose < 2 {
+        filter = filter
+            .add_directive("hyper_util::client=warn".parse().unwrap())
+            .add_directive("h2::frame=warn".parse().unwrap());
+    }
+    if verbose < 1 {
+        filter = filter.add_directive("reqwest::connect=warn".parse().unwrap());
+    }
+
+    let builder = fmt().with_env_filter(filter);
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        builder.without_time().init();
+    } else {
+        builder.init();
+    }
+}
+
 /// A minimal standalone DNS-over-HTTPS forwarding proxy.
 #[derive(Parser)]
 struct Args {
@@ -36,6 +71,15 @@ struct Args {
     #[cfg(feature = "http3")]
     #[arg(long)]
     http3: bool,
+
+    /// Increase logging verbosity (repeatable), unmuting noisier dependency
+    /// targets (h2, hpack, hyper_util) at each step.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Default log level, used when RUST_LOG is unset.
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 /// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
@@ -95,13 +139,14 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    init_log(args.verbose, &args.log_level);
+
     // rustls needs a process-wide CryptoProvider installed before any TLS
     // connection is made; the lib crate leaves this to its consumer.
     tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("no CryptoProvider installed yet");
-
-    let args = Args::parse();
 
     let (basic_auth, stripped_upstream) = extract_userinfo(&args.upstream)?;
     let upstream_uri: Uri = stripped_upstream
@@ -136,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &path,
         opts,
     ));
-    println!("forwarding {} -> {}", args.listen, upstream.address());
+    tracing::info!(listen = %args.listen, upstream = %upstream.address(), "forwarding");
 
     let handler = upstream.into_handler();
     doh_upstream::serve(args.listen, handler).await?;

@@ -119,10 +119,13 @@ pub fn new_dial_context(timeout: Option<Duration>, addrs: Vec<SocketAddr>) -> Di
                 let attempt = dial_one(*addr, network, timeout);
                 match attempt.await {
                     Ok(conn) => {
-                        let _ = start.elapsed();
+                        tracing::debug!(%addr, ?network, elapsed = ?start.elapsed(), "dial succeeded");
                         return Ok(conn);
                     }
-                    Err(e) => last_err = Some(e),
+                    Err(e) => {
+                        tracing::debug!(%addr, ?network, error = %e, "dial failed, trying next address");
+                        last_err = Some(e);
+                    }
                 }
             }
 
@@ -188,6 +191,7 @@ pub async fn resolve_dial_context(
     if ips.is_empty() {
         return Err(DohError::Bootstrap(format!("no addresses for {host}")));
     }
+    tracing::debug!(host, count = ips.len(), "resolved bootstrap addresses");
 
     let mut ips = ips;
     ips.sort_by_key(|ip| {

@@ -59,11 +59,7 @@ fn validate_response(req: &Message, resp: &Message) -> Result<(), DohError> {
         )));
     }
 
-    if !req_q
-        .name()
-        .to_ascii()
-        .eq_ignore_ascii_case(&resp_q.name().to_ascii())
-    {
+    if !req_q.name().eq_ignore_root(resp_q.name()) {
         return Err(DohError::InvalidResponse(format!(
             "mismatched name {:?}",
             resp_q.name()

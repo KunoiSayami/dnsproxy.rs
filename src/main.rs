@@ -85,7 +85,7 @@ struct Args {
     /// Listen on this port for plain DNS (UDP and TCP), on both the IPv4 and
     /// IPv6 wildcard addresses (0.0.0.0 and [::]). Shorthand for
     /// --listen 0.0.0.0:<port> --listen [::]:<port>.
-    #[arg(long, conflicts_with = "listen")]
+    #[arg(long, conflicts_with = "listen", short = 'p')]
     port: Option<u16>,
 
     /// Upstream rule, same syntax as one line of --upstream-file: a plain
@@ -116,7 +116,7 @@ struct Args {
     /// or --bootstrap h3://1.1.1.1/dns-query). May be repeated; queried in
     /// parallel, with the first successful, non-empty result used. Defaults
     /// to the system resolver if omitted.
-    #[arg(long)]
+    #[arg(long = "bootstrap", short = 'b')]
     bootstrap: Vec<String>,
 
     /// Disable TLS certificate verification. Dangerous.

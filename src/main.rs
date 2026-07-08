@@ -75,6 +75,7 @@ pub fn init_log(verbose: u8, default_level: &str) {
 
 /// A minimal standalone DNS-over-HTTPS forwarding proxy.
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     /// Address to listen on for plain DNS (UDP and TCP). May be repeated to
     /// bind multiple addresses, e.g. --listen 0.0.0.0:53 --listen [::]:53.

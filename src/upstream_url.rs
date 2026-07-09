@@ -1,9 +1,9 @@
 //! Parses a single upstream address string into an [`Upstream`], mirroring
 //! the relevant subset of `AddressToUpstream`/`urlToUpstream` in Go's
-//! `upstream/upstream.go`: `https://`/`h3://` for DoH/DoH3, and `udp://` (or
-//! a bare `host[:port]` with no scheme, which defaults to `udp://` just as in
-//! Go) for plain DNS-over-UDP. `tcp://` isn't implemented, since this crate
-//! has no plain DNS-over-TCP client.
+//! `upstream/upstream.go`: `https://`/`h3://` for DoH/DoH3, `tls://` for DoT
+//! (behind the `dot` feature), and `udp://`/`tcp://` (or a bare
+//! `host[:port]` with no scheme, which defaults to `udp://` just as in Go)
+//! for plain DNS-over-UDP/TCP.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +11,10 @@ use std::sync::Arc;
 use hyper::Uri;
 
 use crate::doh::DohUpstream;
+#[cfg(feature = "dot")]
+use crate::dot::DotUpstream;
 use crate::options::{HttpVersion, Options};
+use crate::plain_tcp::PlainTcpUpstream;
 use crate::plain_udp::PlainUdpUpstream;
 use crate::upstream::Upstream;
 
@@ -90,35 +93,100 @@ pub fn parse_upstream(addr: &str, base_opts: &Options) -> Result<Arc<DohUpstream
     Ok(Arc::new(DohUpstream::new(&host, port, &path, opts)))
 }
 
+/// Builds a new [`Options`] from `base`'s fields relevant to non-DoH
+/// transports (no `http_versions`/`basic_auth`), since [`Options`] isn't
+/// `Clone`.
+fn clone_opts(base: &Options) -> Options {
+    Options {
+        bootstrap: base.bootstrap.clone(),
+        http_versions: Vec::new(),
+        timeout: base.timeout,
+        insecure_skip_verify: base.insecure_skip_verify,
+        prefer_ipv6: base.prefer_ipv6,
+        basic_auth: None,
+    }
+}
+
+/// Splits a `host[:port]` authority (no scheme) into a host and an optional
+/// port, for schemes whose upstream may be a bootstrap-resolved hostname
+/// rather than a literal IP (`tcp://`, `tls://`). Bracketed IPv6 hosts
+/// (`[::1]:853`) are supported.
+fn split_host_port(rest: &str) -> Result<(String, Option<u16>), String> {
+    if let Some(stripped) = rest.strip_prefix('[') {
+        let (host, after) = stripped
+            .split_once(']')
+            .ok_or_else(|| format!("invalid host {rest:?}: unterminated \"[\""))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(
+                p.parse::<u16>()
+                    .map_err(|e| format!("invalid port in {rest:?}: {e}"))?,
+            ),
+            None if after.is_empty() => None,
+            None => return Err(format!("invalid host {rest:?}")),
+        };
+        return Ok((host.to_owned(), port));
+    }
+
+    match rest.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port in {rest:?}: {e}"))?;
+            Ok((host.to_owned(), Some(port)))
+        }
+        _ => Ok((rest.to_owned(), None)),
+    }
+}
+
 /// Parses `addr` into an [`Upstream`], extending [`parse_upstream`] with
 /// `udp://host[:port]` (or a bare `host[:port]`/`host`, which defaults to
-/// `udp://` just as in Go's `AddressToUpstream`) for plain DNS-over-UDP.
-/// Plain upstreams must use a literal IP host, since this crate has no
-/// separate bootstrap step for them.
+/// `udp://` just as in Go's `AddressToUpstream`) for plain DNS-over-UDP,
+/// `tcp://host[:port]` for plain DNS-over-TCP, and `tls://host[:port]` for
+/// DoT (behind the `dot` feature). `udp://` upstreams must use a literal IP
+/// host, since this crate has no separate bootstrap step for them; `tcp://`
+/// and `tls://` may use a hostname.
 pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, String> {
     let (scheme, rest) = match addr.split_once("://") {
         Some((scheme, rest)) => (scheme, rest),
         None => ("udp", addr),
     };
 
-    if scheme != "udp" {
-        return Ok(Upstream::Doh(parse_upstream(addr, base_opts)?));
+    match scheme {
+        "udp" => {
+            let sock_addr = if let Ok(sock_addr) = rest.parse::<SocketAddr>() {
+                sock_addr
+            } else if let Ok(ip) = rest.parse::<std::net::IpAddr>() {
+                SocketAddr::new(ip, DEFAULT_PORT_PLAIN)
+            } else {
+                return Err(format!(
+                    "plain upstream {addr:?} must use a literal IP host"
+                ));
+            };
+
+            Ok(Upstream::PlainUdp(Arc::new(PlainUdpUpstream::new(
+                sock_addr,
+                base_opts.timeout,
+            ))))
+        }
+        "tcp" => {
+            let (host, port) = split_host_port(rest)?;
+            Ok(Upstream::PlainTcp(Arc::new(PlainTcpUpstream::new(
+                &host,
+                port,
+                clone_opts(base_opts),
+            ))))
+        }
+        #[cfg(feature = "dot")]
+        "tls" => {
+            let (host, port) = split_host_port(rest)?;
+            Ok(Upstream::Dot(Arc::new(DotUpstream::new(
+                &host,
+                port,
+                clone_opts(base_opts),
+            ))))
+        }
+        _ => Ok(Upstream::Doh(parse_upstream(addr, base_opts)?)),
     }
-
-    let sock_addr = if let Ok(sock_addr) = rest.parse::<SocketAddr>() {
-        sock_addr
-    } else if let Ok(ip) = rest.parse::<std::net::IpAddr>() {
-        SocketAddr::new(ip, DEFAULT_PORT_PLAIN)
-    } else {
-        return Err(format!(
-            "plain upstream {addr:?} must use a literal IP host"
-        ));
-    };
-
-    Ok(Upstream::PlainUdp(Arc::new(PlainUdpUpstream::new(
-        sock_addr,
-        base_opts.timeout,
-    ))))
 }
 
 #[cfg(test)]
@@ -179,5 +247,37 @@ mod tests {
     fn any_upstream_still_parses_doh() {
         let u = parse_any_upstream("https://dns.google/dns-query", &Options::default()).unwrap();
         assert_eq!(u.address(), "https://dns.google:443/dns-query");
+    }
+
+    #[test]
+    fn parses_tcp_scheme_upstream_with_hostname() {
+        let u = parse_any_upstream("tcp://dns.google:53", &Options::default()).unwrap();
+        assert_eq!(u.address(), "tcp://dns.google:53");
+    }
+
+    #[test]
+    fn parses_tcp_scheme_upstream_default_port() {
+        let u = parse_any_upstream("tcp://127.0.0.1", &Options::default()).unwrap();
+        assert_eq!(u.address(), "tcp://127.0.0.1:53");
+    }
+
+    #[cfg(feature = "dot")]
+    #[test]
+    fn parses_tls_scheme_upstream() {
+        let u = parse_any_upstream("tls://dns.google", &Options::default()).unwrap();
+        assert_eq!(u.address(), "tls://dns.google:853");
+    }
+
+    #[cfg(feature = "dot")]
+    #[test]
+    fn parses_tls_scheme_upstream_with_port() {
+        let u = parse_any_upstream("tls://1.1.1.1:853", &Options::default()).unwrap();
+        assert_eq!(u.address(), "tls://1.1.1.1:853");
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_host() {
+        let u = parse_any_upstream("tcp://[::1]:530", &Options::default()).unwrap();
+        assert_eq!(u.address(), "tcp://[::1]:530");
     }
 }

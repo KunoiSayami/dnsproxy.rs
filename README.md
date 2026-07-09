@@ -1,21 +1,26 @@
 # doh-upstream
 
-A DNS-over-HTTPS ([RFC 8484](https://www.rfc-editor.org/rfc/rfc8484)) upstream
-client for Rust, ported from [AdGuard dnsproxy](https://github.com/AdguardTeam/dnsproxy)'s
-Go implementation (`upstream/doh.go`).
+A DNS upstream client for Rust, ported from [AdGuard dnsproxy](https://github.com/AdguardTeam/dnsproxy)'s
+Go implementation. Started as a DNS-over-HTTPS ([RFC 8484](https://www.rfc-editor.org/rfc/rfc8484))
+client (`upstream/doh.go`) and has grown to cover DoT, DoH3, and plain
+DNS-over-UDP/TCP.
 
 HTTP/1.1 and HTTP/2 are supported unconditionally; HTTP/3 is available behind
 the `http3` feature and races a QUIC handshake against TLS to decide whether
-to prefer it, matching the Go client's probing behavior.
+to prefer it, matching the Go client's probing behavior. DNS-over-TLS is
+available behind the `dot` feature.
 
 ## Features
 
 - DNS message exchange over DoH using `hyper` (HTTP/1.1 / HTTP/2) and
   optionally `quinn`/`h3` (HTTP/3)
-- Configurable bootstrap resolver for resolving the DoH server's hostname
+- DNS-over-TLS (`tls://`, RFC 7858), behind the `dot` feature
+- Plain DNS-over-UDP (`udp://`) and DNS-over-TCP (`tcp://`)
+- Configurable bootstrap resolver for resolving the upstream server's
+  hostname
 - Automatic retry with a fresh client on retryable errors (timeouts, QUIC
   0-RTT rejection)
-- Optional HTTP Basic Auth credentials sent with every upstream request
+- Optional HTTP Basic Auth credentials sent with every DoH upstream request
 - A minimal plain-DNS server (`serve`/`serve_all`) that forwards UDP/TCP
   queries to any async handler, so a `DohUpstream` can be turned into a
   local DNS-to-DoH proxy with `into_handler`, listening on one or more
@@ -26,7 +31,8 @@ to prefer it, matching the Go client's probing behavior.
 - Domain-scoped upstream routing (`UpstreamConfig`), parsing an AdGuard
   dnsproxy-style upstream list — including `[/domain1/.../domainN/]upstream1
   upstream2 ...` rules — with hierarchical suffix matching and in-order
-  fallback across an upstream rule's servers
+  fallback across an upstream rule's servers, mixing any of the supported
+  transports
 
 ## Standalone binary
 
@@ -54,7 +60,7 @@ Useful flags:
 |---|---|
 | `--listen <addr>` | Address to listen on for plain DNS (UDP+TCP). Repeatable. |
 | `--port <port>` | Shorthand for listening on the IPv4 and IPv6 wildcard addresses on this port. |
-| `--upstream-file <path>` | Path to an upstream config file (see above). Upstreams are DoH URLs (`https://`, or `h3://` for HTTP/3-only), optionally with HTTP Basic Auth as `user:pass@host`. |
+| `--upstream-file <path>` | Path to an upstream config file (see above). Upstreams may be DoH URLs (`https://`, or `h3://` for HTTP/3-only, optionally with HTTP Basic Auth as `user:pass@host`), `tls://host[:port]` for DoT (requires the `dot` feature), `tcp://host[:port]` for plain DNS-over-TCP, or `udp://host[:port]`/a bare `host[:port]` for plain DNS-over-UDP. |
 | `--timeout <secs>` | Overall timeout for exchanges, bootstrap lookups, and H3 probes (default `10`). |
 | `--bootstrap <addr>` | Server used to resolve upstream hostnames: a plain DNS address, e.g. `1.1.1.1` or `[2606:4700:4700::1111]:53` (port defaults to `53`), or a DoH/DoH3 URL with a literal IP host, e.g. `https://1.1.1.1/dns-query` (`h3://` requires `--http3`). Repeatable; queried in parallel. Defaults to the system resolver. |
 | `--insecure` | Disable TLS certificate verification. |
@@ -93,6 +99,7 @@ serve("127.0.0.1:5353".parse()?, upstream.into_handler()).await?;
 | Feature | Default | Description |
 |---|---|---|
 | `http3` | yes | Enables HTTP/3 support via `quinn`, `h3`, and `h3-quinn` |
+| `dot` | yes | Enables DNS-over-TLS (`tls://`) support |
 | `crypto-ring` | yes | Uses `ring` as rustls's crypto backend: pure Rust, no C toolchain, smaller binary |
 | `crypto-aws-lc-rs` | no | Uses `aws-lc-rs` instead: adds FIPS validation and post-quantum key exchange support, at the cost of a C/assembly build step and a larger binary |
 

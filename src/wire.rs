@@ -39,6 +39,17 @@ pub fn decode_response(body: &[u8], req: &Message, original_id: u16) -> Result<M
     Ok(resp)
 }
 
+/// Formats a `host:port` authority for display, bracketing `host` if it's a
+/// literal IPv6 address (e.g. `[::1]:53` rather than the ambiguous
+/// `::1:53`).
+pub fn format_host_port(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Mirrors `validateResponse` in `upstream/upstream.go`: exactly one
 /// question, matching type, and case-insensitively matching name.
 pub fn validate_response(req: &Message, resp: &Message) -> Result<(), DohError> {

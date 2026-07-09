@@ -373,7 +373,7 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(" -> ")
 }
 
-fn build_tls_config(
+pub(crate) fn build_tls_config(
     server_name: &str,
     insecure_skip_verify: bool,
     alpn: Vec<Vec<u8>>,

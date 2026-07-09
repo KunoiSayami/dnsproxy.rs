@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
@@ -71,6 +71,11 @@ doq = ["dep:quinn", "dep:rustls"]
 # downstream clients, forwarding what it receives to the configured
 # upstream(s) via the same Handler the plain UDP/TCP listener uses. Each is
 # independently toggleable from its client-side counterpart above.
+#
+# doh-server/http3-server also include HTTP Basic Auth support for their
+# listeners (requests must present one of a configured set of
+# username:password credentials): it adds no dependencies of its own, so
+# there's no separate feature for it.
 doq-server = ["doq", "dep:rustls-pemfile"]
 dot-server = ["dot", "dep:rustls-pemfile"]
 doh-server = ["dep:rustls", "dep:rustls-pemfile"]

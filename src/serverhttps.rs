@@ -9,13 +9,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::CONTENT_TYPE;
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio_rustls::TlsAcceptor;
 
+use crate::doh_auth::Credentials;
 use crate::error::DohError;
 use crate::server::{Handler, bind_tcp};
 use crate::wire::{decode_request, encode_response};
@@ -25,14 +26,23 @@ pub const DOH_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// Runs a DoH listener on every address in `addrs`, dispatching every
 /// decoded query to `handler`. Returns once every listener is bound; the
-/// accept loops keep running in spawned tasks.
+/// accept loops keep running in spawned tasks. `credentials`, if non-empty,
+/// requires every request to present one of its configured `user:password`
+/// pairs via HTTP Basic Auth.
 pub async fn serve_all(
     addrs: &[SocketAddr],
     tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     handler: Handler,
+    credentials: Arc<Credentials>,
 ) -> Result<(), DohError> {
     for &addr in addrs {
-        serve(addr, Arc::clone(&tls_config), Arc::clone(&handler)).await?;
+        serve(
+            addr,
+            Arc::clone(&tls_config),
+            Arc::clone(&handler),
+            Arc::clone(&credentials),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -43,6 +53,7 @@ pub async fn serve(
     addr: SocketAddr,
     tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     handler: Handler,
+    credentials: Arc<Credentials>,
 ) -> Result<SocketAddr, DohError> {
     let listener = bind_tcp(addr)?;
     let bound_addr = listener.local_addr()?;
@@ -51,13 +62,18 @@ pub async fn serve(
     tracing::info!(addr = %bound_addr, "listening for doh queries");
 
     tokio::spawn(async move {
-        accept_loop(listener, acceptor, handler).await;
+        accept_loop(listener, acceptor, handler, credentials).await;
     });
 
     Ok(bound_addr)
 }
 
-async fn accept_loop(listener: tokio::net::TcpListener, acceptor: TlsAcceptor, handler: Handler) {
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+    handler: Handler,
+    credentials: Arc<Credentials>,
+) {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -68,8 +84,9 @@ async fn accept_loop(listener: tokio::net::TcpListener, acceptor: TlsAcceptor, h
         };
         let acceptor = acceptor.clone();
         let handler = Arc::clone(&handler);
+        let credentials = Arc::clone(&credentials);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, acceptor, handler).await {
+            if let Err(e) = handle_connection(tcp, acceptor, handler, credentials).await {
                 tracing::warn!(%peer, error = %e, "doh connection failed");
             }
         });
@@ -80,13 +97,15 @@ async fn handle_connection(
     tcp: tokio::net::TcpStream,
     acceptor: TlsAcceptor,
     handler: Handler,
+    credentials: Arc<Credentials>,
 ) -> Result<(), DohError> {
     let tls = acceptor
         .accept(tcp)
         .await
         .map_err(|e| DohError::Http(format!("tls handshake failed: {e}")))?;
 
-    let service = service_fn(move |req| handle_request(req, Arc::clone(&handler)));
+    let service =
+        service_fn(move |req| handle_request(req, Arc::clone(&handler), Arc::clone(&credentials)));
     auto::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls), service)
         .await
@@ -96,20 +115,35 @@ async fn handle_connection(
 async fn handle_request(
     req: Request<Incoming>,
     handler: Handler,
+    credentials: Arc<Credentials>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(match handle_request_inner(req, handler).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, "doh query failed");
-            error_response(StatusCode::BAD_REQUEST)
-        }
-    })
+    Ok(
+        match handle_request_inner(req, handler, credentials).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(error = %e, "doh query failed");
+                error_response(StatusCode::BAD_REQUEST)
+            }
+        },
+    )
 }
 
 async fn handle_request_inner(
     req: Request<Incoming>,
     handler: Handler,
+    credentials: Arc<Credentials>,
 ) -> Result<Response<Full<Bytes>>, DohError> {
+    if !credentials.is_empty() {
+        let authorized = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| credentials.is_authorized(Some(v)));
+        if !authorized {
+            return Ok(unauthorized_response());
+        }
+    }
+
     let dns_param = req.uri().query().and_then(find_dns_param);
 
     let body = match *req.method() {
@@ -158,6 +192,14 @@ fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
         .expect("static response is valid")
 }
 
+fn unauthorized_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(WWW_AUTHENTICATE, "Basic")
+        .body(Full::new(Bytes::new()))
+        .expect("static response is valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,12 +239,17 @@ mod tests {
         })
     }
 
+    fn no_credentials() -> Arc<Credentials> {
+        Arc::new(Credentials::new([]))
+    }
+
     #[tokio::test]
     async fn roundtrips_through_doh_upstream_client() {
         let addr = serve(
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(server_tls_config()),
             echo_handler(),
+            no_credentials(),
         )
         .await
         .unwrap();
@@ -223,5 +270,39 @@ mod tests {
         let resp = upstream.exchange(&req).await.unwrap();
         assert_eq!(resp.metadata.id, 42);
         assert_eq!(resp.metadata.message_type, MessageType::Response);
+    }
+
+    #[tokio::test]
+    async fn rejects_request_missing_credentials() {
+        let addr = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(server_tls_config()),
+            echo_handler(),
+            Arc::new(Credentials::new([(
+                "alice".to_owned(),
+                "secret".to_owned(),
+            )])),
+        )
+        .await
+        .unwrap();
+
+        let upstream = DohUpstream::new(
+            "localhost",
+            Some(addr.port()),
+            "/dns-query",
+            crate::options::Options {
+                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                timeout: Some(Duration::from_secs(5)),
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+        );
+
+        let req = make_query(42, "example.com.");
+        let result = upstream.exchange(&req).await;
+        assert!(matches!(
+            result,
+            Err(DohError::UnexpectedStatus { status: 401, .. })
+        ));
     }
 }

@@ -12,6 +12,8 @@ pub mod cache;
 pub mod doh;
 #[cfg(feature = "http3")]
 pub mod doh3;
+#[cfg(feature = "doh-server")]
+pub mod doh_auth;
 #[cfg(feature = "doq")]
 pub mod doq;
 #[cfg(feature = "dot")]
@@ -38,6 +40,8 @@ pub mod wire;
 
 pub use cache::{Cache, CacheOptions};
 pub use doh::DohUpstream;
+#[cfg(feature = "doh-server")]
+pub use doh_auth::Credentials;
 #[cfg(feature = "doq")]
 pub use doq::DoqUpstream;
 #[cfg(feature = "dot")]

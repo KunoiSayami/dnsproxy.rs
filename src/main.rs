@@ -228,6 +228,22 @@ struct Args {
     #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
     #[arg(long = "tls-key", requires = "listener_tls_cert")]
     listener_tls_key: Option<PathBuf>,
+
+    /// Require HTTP Basic Auth on the DoH/DoH3 listeners, in `user:password`
+    /// form. May be repeated to allow multiple credentials; any one
+    /// matching pair authenticates a request. Combined with the credentials
+    /// from --doh-auth-file, if given. If neither is given, the DoH/DoH3
+    /// listeners accept unauthenticated requests.
+    #[cfg(feature = "doh-server")]
+    #[arg(long = "doh-auth")]
+    doh_auth: Vec<String>,
+
+    /// Path to a file of `user:password` credentials for the DoH/DoH3
+    /// listeners, one per line; see --doh-auth for the line syntax. Blank
+    /// lines and lines starting with # are ignored.
+    #[cfg(feature = "doh-server")]
+    #[arg(long)]
+    doh_auth_file: Option<PathBuf>,
 }
 
 /// The standard reverse-DNS zones for RFC 1918 private and RFC 6303
@@ -404,6 +420,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("parsing upstreams: {joined}")
     })?;
 
+    #[cfg(feature = "doh-server")]
+    let doh_credentials = {
+        let doh_auth_file_text = args
+            .doh_auth_file
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("reading {}: {e}", path.display()))
+            })
+            .transpose()?;
+        let pairs = args
+            .doh_auth
+            .iter()
+            .map(String::as_str)
+            .chain(
+                doh_auth_file_text
+                    .iter()
+                    .flat_map(|text| text.lines())
+                    .filter(|line| !line.is_empty() && !line.starts_with('#')),
+            )
+            .map(doh_upstream::Credentials::parse_pair)
+            .collect::<Result<Vec<_>, _>>()?;
+        Arc::new(doh_upstream::Credentials::new(pairs))
+    };
+
     let listen_addrs = args.listen_addrs();
     tracing::info!(listen = ?listen_addrs, upstream_file = ?args.upstream_file, "forwarding");
 
@@ -510,14 +551,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &https_addrs,
                     Arc::clone(&tls_config),
                     handler.clone(),
+                    Arc::clone(&doh_credentials),
                 )
                 .await?;
 
                 #[cfg(feature = "http3-server")]
                 {
                     tracing::info!(listen = ?https_addrs, "doh3 listening");
-                    doh_upstream::serverhttp3::serve_all(&https_addrs, tls_config, handler.clone())
-                        .await?;
+                    doh_upstream::serverhttp3::serve_all(
+                        &https_addrs,
+                        tls_config,
+                        handler.clone(),
+                        Arc::clone(&doh_credentials),
+                    )
+                    .await?;
                 }
             }
         }

@@ -195,12 +195,20 @@ pub(crate) async fn read_prefixed<S: tokio::io::AsyncRead + Unpin>(
     Ok(buf)
 }
 
-/// Mirrors `writePrefixed` in `proxy/servertcp.go`.
+/// Mirrors `writePrefixed` in `proxy/servertcp.go`. Rejects bodies that don't
+/// fit the 2-byte length prefix rather than silently truncating the length
+/// (which would desync the stream), matching the guard the DoQ listener
+/// applies to its own framing.
 pub(crate) async fn write_prefixed<S: tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
     body: &[u8],
 ) -> Result<(), DohError> {
-    stream.write_u16(body.len() as u16).await?;
+    let len = u16::try_from(body.len()).map_err(|_| {
+        DohError::Pack(hickory_proto::ProtoError::from(
+            "response too large for 2-byte length prefix",
+        ))
+    })?;
+    stream.write_u16(len).await?;
     stream.write_all(body).await?;
     Ok(())
 }

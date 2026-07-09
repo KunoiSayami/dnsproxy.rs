@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"

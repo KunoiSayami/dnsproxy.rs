@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
-use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::rr::{DNSClass, Name, Record, RecordType};
 use lru::LruCache;
 use tokio::sync::Mutex;
 
@@ -32,6 +32,14 @@ struct CacheKey {
     name: Name,
     query_type: RecordType,
     query_class: DNSClass,
+    /// The EDNS `DO` (DNSSEC OK) bit. Part of the key because a `DO=0` query
+    /// yields a response stripped of RRSIG/DNSSEC records, and serving that to
+    /// a `DO=1` validating client (or vice versa) produces a wrong answer.
+    dnssec_ok: bool,
+    /// The `CD` (Checking Disabled) header bit. A `CD=1` query may return data
+    /// that failed validation upstream; it must not be served to a `CD=0`
+    /// client expecting validated results.
+    checking_disabled: bool,
 }
 
 struct CacheEntry {
@@ -93,7 +101,7 @@ impl Cache {
         let remaining = (entry.ttl - elapsed).as_secs() as u32;
         let mut resp = entry.response.clone();
         resp.metadata.id = id;
-        for record in resp.answers.iter_mut() {
+        for record in all_records_mut(&mut resp) {
             record.ttl = remaining;
         }
         Some(resp)
@@ -111,12 +119,15 @@ impl Cache {
         self.entries.lock().await.put(key, entry);
     }
 
-    /// The TTL to store a response under: the minimum TTL among its answer
-    /// records, clamped to `[min_ttl, max_ttl]`. Responses with no answers
-    /// (e.g. NXDOMAIN/NODATA) aren't cached, since there's no RR TTL to base
-    /// an entry on.
+    /// The TTL to store a response under: the minimum TTL among its records
+    /// across all sections (answer, authority, additional), clamped to
+    /// `[min_ttl, max_ttl]`. Responses with no real records (e.g. NXDOMAIN/
+    /// NODATA carrying only an SOA in the authority section still count that
+    /// SOA; a bare response with nothing to cache returns `None`). The OPT
+    /// pseudo-record is skipped, since its "TTL" field encodes EDNS flags, not
+    /// a lifetime.
     fn response_ttl(&self, resp: &Message) -> Option<Duration> {
-        let min_rr_ttl = resp.answers.iter().map(|r| r.ttl).min()?;
+        let min_rr_ttl = cacheable_records(resp).map(|r| r.ttl).min()?;
         let mut ttl = Duration::from_secs(min_rr_ttl as u64);
 
         if ttl < self.min_ttl {
@@ -140,7 +151,30 @@ fn cache_key(req: &Message) -> Option<CacheKey> {
         name: q.name().clone(),
         query_type: q.query_type(),
         query_class: q.query_class,
+        dnssec_ok: req.edns.as_ref().is_some_and(|edns| edns.flags().dnssec_ok),
+        checking_disabled: req.metadata.checking_disabled,
     })
+}
+
+/// Iterates the records across all three sections whose TTL is meaningful for
+/// caching, skipping the OPT pseudo-record (whose TTL field carries EDNS
+/// flags/version rather than a lifetime).
+fn cacheable_records(msg: &Message) -> impl Iterator<Item = &Record> {
+    msg.answers
+        .iter()
+        .chain(msg.authorities.iter())
+        .chain(msg.additionals.iter())
+        .filter(|r| r.record_type() != RecordType::OPT)
+}
+
+/// The mutable counterpart of [`cacheable_records`], for rewriting the
+/// remaining TTL on a cache hit.
+fn all_records_mut(msg: &mut Message) -> impl Iterator<Item = &mut Record> {
+    msg.answers
+        .iter_mut()
+        .chain(msg.authorities.iter_mut())
+        .chain(msg.additionals.iter_mut())
+        .filter(|r| r.record_type() != RecordType::OPT)
 }
 
 #[cfg(test)]
@@ -222,6 +256,51 @@ mod tests {
         resp.metadata.message_type = MessageType::Response;
 
         assert!(cache.response_ttl(&resp).is_none());
+    }
+
+    #[tokio::test]
+    async fn dnssec_ok_queries_get_a_distinct_key() {
+        use hickory_proto::op::Edns;
+
+        let plain = query(1, "example.com.");
+
+        let mut with_do = query(1, "example.com.");
+        let mut edns = Edns::new();
+        edns.flags_mut().dnssec_ok = true;
+        with_do.set_edns(edns);
+
+        // Same question, differing only by the DO bit, must not collide: a
+        // DO=0 answer (RRSIG-stripped) must never be served to a DO=1 client.
+        assert_ne!(cache_key(&plain), cache_key(&with_do));
+    }
+
+    #[tokio::test]
+    async fn checking_disabled_queries_get_a_distinct_key() {
+        let plain = query(1, "example.com.");
+        let mut cd = query(1, "example.com.");
+        cd.metadata.checking_disabled = true;
+
+        assert_ne!(cache_key(&plain), cache_key(&cd));
+    }
+
+    #[tokio::test]
+    async fn authority_records_are_ttl_decremented_on_hit() {
+        let cache = Cache::new(opts());
+        let req = query(1, "example.com.");
+        let mut resp = response_with_ttl(&req, 300);
+        // An authority record with a longer TTL than the answer; on a hit it
+        // must be rewritten to the remaining lifetime, not served verbatim.
+        resp.authorities.push(Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            9999,
+            RData::A(A::from(Ipv4Addr::new(5, 6, 7, 8))),
+        ));
+
+        let key = cache_key(&req).unwrap();
+        cache.insert(key.clone(), &resp).await;
+
+        let hit = cache.get(&key, 1).await.unwrap();
+        assert!(hit.authorities[0].ttl <= 300);
     }
 
     #[tokio::test]

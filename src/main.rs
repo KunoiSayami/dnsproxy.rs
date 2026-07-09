@@ -31,7 +31,7 @@ fn install_crypto_provider() {
         .expect("no CryptoProvider installed yet");
 }
 
-pub fn init_log(verbose: u8, default_level: &str) {
+pub fn init_log(verbose: u8, default_level: &str, no_timestamp: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let mut filter =
@@ -66,7 +66,7 @@ pub fn init_log(verbose: u8, default_level: &str) {
     }
 
     let builder = fmt().with_env_filter(filter);
-    if std::env::var_os("JOURNAL_STREAM").is_some() {
+    if no_timestamp || std::env::var_os("JOURNAL_STREAM").is_some() {
         builder.without_time().init();
     } else {
         builder.init();
@@ -94,7 +94,11 @@ struct Args {
     /// upstreams for those domains and their subdomains, tried in order on
     /// failure. Upstreams are DoH URLs, e.g. https://dns.google/dns-query or
     /// h3://1.1.1.1/dns-query (HTTP/3-only), optionally with HTTP Basic Auth
-    /// userinfo (https://user:pass@example.com/dns-query). May be repeated;
+    /// userinfo (https://user:pass@example.com/dns-query); or a plain
+    /// DNS-over-UDP address with a literal IP host, e.g. udp://127.0.0.1:53
+    /// or bare 127.0.0.1:53 (port defaults to 53), useful for routing
+    /// reverse-DNS (in-addr.arpa/ip6.arpa) rules to a local resolver like
+    /// dnsmasq that knows real DHCP lease hostnames. May be repeated;
     /// combined with the rules from --upstream-file, if given. At least one
     /// of --upstream or --upstream-file is required.
     #[arg(short = 'u', long = "upstream")]
@@ -140,6 +144,11 @@ struct Args {
     /// Default log level, used when RUST_LOG is unset.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Disable timestamps in log output, e.g. when the log collector already
+    /// adds its own (always implied under systemd's journal).
+    #[arg(long)]
+    no_timestamp: bool,
 
     /// Cache upstream responses in memory.
     #[arg(long)]
@@ -209,7 +218,7 @@ impl Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    init_log(args.verbose, &args.log_level);
+    init_log(args.verbose, &args.log_level, args.no_timestamp);
 
     install_crypto_provider();
 

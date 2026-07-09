@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use hickory_proto::op::Message;
 
-use crate::doh::DohUpstream;
 use crate::error::DohError;
 use crate::options::Options;
 use crate::server::Handler;
-use crate::upstream_url::parse_upstream;
+use crate::upstream::Upstream;
+use crate::upstream_url::parse_any_upstream;
 
 /// A separator between labels of a domain name.
 const LABEL_SEP: char = '.';
@@ -26,10 +26,10 @@ const LABEL_SEP: char = '.';
 pub struct UpstreamConfig {
     /// Rules keyed by lowercased, dot-terminated domain (e.g. `"host.com."`),
     /// tried in order on failure.
-    domain_upstreams: HashMap<Box<str>, Vec<Arc<DohUpstream>>>,
+    domain_upstreams: HashMap<Box<str>, Vec<Arc<Upstream>>>,
 
     /// Upstreams used for queries that don't match any domain rule.
-    default_upstreams: Vec<Arc<DohUpstream>>,
+    default_upstreams: Vec<Arc<Upstream>>,
 }
 
 impl UpstreamConfig {
@@ -41,8 +41,8 @@ impl UpstreamConfig {
         // Dedupes identical upstream strings within one file, so a domain
         // list that repeats the same fallback server doesn't create a fresh
         // client (and connection pool) per line.
-        let mut upstream_index: HashMap<String, Arc<DohUpstream>> = HashMap::new();
-        let mut domain_upstreams: HashMap<Box<str>, Vec<Arc<DohUpstream>>> = HashMap::new();
+        let mut upstream_index: HashMap<String, Arc<Upstream>> = HashMap::new();
+        let mut domain_upstreams: HashMap<Box<str>, Vec<Arc<Upstream>>> = HashMap::new();
         let mut default_upstreams = Vec::new();
         let mut errors = Vec::new();
 
@@ -63,8 +63,9 @@ impl UpstreamConfig {
             for u in &upstream_strs {
                 let upstream = match upstream_index.get(u.as_str()) {
                     Some(existing) => Arc::clone(existing),
-                    None => match parse_upstream(u, base_opts) {
+                    None => match parse_any_upstream(u, base_opts) {
                         Ok(built) => {
+                            let built = Arc::new(built);
                             upstream_index.insert(u.clone(), Arc::clone(&built));
                             built
                         }
@@ -102,7 +103,7 @@ impl UpstreamConfig {
     /// preferring the most specific matching domain rule and falling back to
     /// [`Self::default_upstreams`] if none match. Mirrors
     /// `UpstreamConfig.getUpstreamsForDomain`.
-    pub fn upstreams_for(&self, fqdn: &str) -> &[Arc<DohUpstream>] {
+    pub fn upstreams_for(&self, fqdn: &str) -> &[Arc<Upstream>] {
         if self.domain_upstreams.is_empty() {
             return &self.default_upstreams;
         }
@@ -255,6 +256,27 @@ mod tests {
         assert_eq!(ups.len(), 2);
         assert_eq!(ups[0].address(), "https://1.1.1.1:443/dns-query");
         assert_eq!(ups[1].address(), "https://2.2.2.2:443/dns-query");
+    }
+
+    #[test]
+    fn plain_udp_rule_can_be_mixed_with_doh() {
+        let cfg = UpstreamConfig::parse(
+            &[
+                "[/7.168.192.in-addr.arpa/]127.0.0.1:53",
+                "https://1.1.1.1/dns-query",
+            ],
+            &opts(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.upstreams_for("163.7.168.192.in-addr.arpa.")[0].address(),
+            "udp://127.0.0.1:53"
+        );
+        assert_eq!(
+            cfg.upstreams_for("example.com.")[0].address(),
+            "https://1.1.1.1:443/dns-query"
+        );
     }
 
     #[test]

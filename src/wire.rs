@@ -41,7 +41,7 @@ pub fn decode_response(body: &[u8], req: &Message, original_id: u16) -> Result<M
 
 /// Mirrors `validateResponse` in `upstream/upstream.go`: exactly one
 /// question, matching type, and case-insensitively matching name.
-fn validate_response(req: &Message, resp: &Message) -> Result<(), DohError> {
+pub fn validate_response(req: &Message, resp: &Message) -> Result<(), DohError> {
     if resp.queries.len() != 1 {
         return Err(DohError::InvalidResponse(format!(
             "only 1 question allowed; got {}",

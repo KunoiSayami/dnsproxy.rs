@@ -1,14 +1,22 @@
-//! Parses a single upstream address string into a [`DohUpstream`], mirroring
+//! Parses a single upstream address string into an [`Upstream`], mirroring
 //! the relevant subset of `AddressToUpstream`/`urlToUpstream` in Go's
-//! `upstream/upstream.go` (only the `https://` and `h3://` schemes, since
-//! this crate only implements a DoH/DoH3 transport).
+//! `upstream/upstream.go`: `https://`/`h3://` for DoH/DoH3, and `udp://` (or
+//! a bare `host[:port]` with no scheme, which defaults to `udp://` just as in
+//! Go) for plain DNS-over-UDP. `tcp://` isn't implemented, since this crate
+//! has no plain DNS-over-TCP client.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hyper::Uri;
 
 use crate::doh::DohUpstream;
 use crate::options::{HttpVersion, Options};
+use crate::plain_udp::PlainUdpUpstream;
+use crate::upstream::Upstream;
+
+/// Default port for plain DNS, matching Go's `defaultPortPlain`.
+const DEFAULT_PORT_PLAIN: u16 = 53;
 
 /// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
 /// since [`Uri`] treats the whole authority as opaque and won't parse it for
@@ -82,6 +90,37 @@ pub fn parse_upstream(addr: &str, base_opts: &Options) -> Result<Arc<DohUpstream
     Ok(Arc::new(DohUpstream::new(&host, port, &path, opts)))
 }
 
+/// Parses `addr` into an [`Upstream`], extending [`parse_upstream`] with
+/// `udp://host[:port]` (or a bare `host[:port]`/`host`, which defaults to
+/// `udp://` just as in Go's `AddressToUpstream`) for plain DNS-over-UDP.
+/// Plain upstreams must use a literal IP host, since this crate has no
+/// separate bootstrap step for them.
+pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, String> {
+    let (scheme, rest) = match addr.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("udp", addr),
+    };
+
+    if scheme != "udp" {
+        return Ok(Upstream::Doh(parse_upstream(addr, base_opts)?));
+    }
+
+    let sock_addr = if let Ok(sock_addr) = rest.parse::<SocketAddr>() {
+        sock_addr
+    } else if let Ok(ip) = rest.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, DEFAULT_PORT_PLAIN)
+    } else {
+        return Err(format!(
+            "plain upstream {addr:?} must use a literal IP host"
+        ));
+    };
+
+    Ok(Upstream::PlainUdp(Arc::new(PlainUdpUpstream::new(
+        sock_addr,
+        base_opts.timeout,
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +149,35 @@ mod tests {
             &Options::default(),
         )
         .unwrap();
+        assert_eq!(u.address(), "https://dns.google:443/dns-query");
+    }
+
+    #[test]
+    fn parses_udp_scheme_upstream() {
+        let u = parse_any_upstream("udp://127.0.0.1:53", &Options::default()).unwrap();
+        assert_eq!(u.address(), "udp://127.0.0.1:53");
+    }
+
+    #[test]
+    fn bare_address_defaults_to_udp() {
+        let u = parse_any_upstream("127.0.0.1", &Options::default()).unwrap();
+        assert_eq!(u.address(), "udp://127.0.0.1:53");
+    }
+
+    #[test]
+    fn bare_address_with_port_defaults_to_udp() {
+        let u = parse_any_upstream("127.0.0.1:5353", &Options::default()).unwrap();
+        assert_eq!(u.address(), "udp://127.0.0.1:5353");
+    }
+
+    #[test]
+    fn plain_upstream_rejects_hostname() {
+        assert!(parse_any_upstream("udp://dns.google", &Options::default()).is_err());
+    }
+
+    #[test]
+    fn any_upstream_still_parses_doh() {
+        let u = parse_any_upstream("https://dns.google/dns-query", &Options::default()).unwrap();
         assert_eq!(u.address(), "https://dns.google:443/dns-query");
     }
 }

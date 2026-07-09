@@ -98,9 +98,11 @@ struct Args {
     /// DNS-over-UDP address with a literal IP host, e.g. udp://127.0.0.1:53
     /// or bare 127.0.0.1:53 (port defaults to 53), useful for routing
     /// reverse-DNS (in-addr.arpa/ip6.arpa) rules to a local resolver like
-    /// dnsmasq that knows real DHCP lease hostnames. May be repeated;
-    /// combined with the rules from --upstream-file, if given. At least one
-    /// of --upstream or --upstream-file is required.
+    /// dnsmasq that knows real DHCP lease hostnames. If the value names an
+    /// existing file instead, it's read as an upstream config file (same
+    /// syntax as --upstream-file). May be repeated; combined with the rules
+    /// from --upstream-file, if given. At least one of --upstream or
+    /// --upstream-file is required.
     #[arg(short = 'u', long = "upstream")]
     upstreams: Vec<String>,
 
@@ -404,11 +406,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
         })
         .transpose()?;
+    let upstream_arg_text = args
+        .upstreams
+        .iter()
+        .map(|s| {
+            let path = std::path::Path::new(s);
+            if path.is_file() {
+                std::fs::read_to_string(path).map_err(|e| format!("reading {s}: {e}"))
+            } else {
+                Ok(s.clone())
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let private_upstream_line = args.private_upstream.as_deref().map(private_upstream_line);
     let lines: Vec<&str> = private_upstream_line
         .iter()
         .map(String::as_str)
-        .chain(args.upstreams.iter().map(String::as_str))
+        .chain(upstream_arg_text.iter().flat_map(|text| text.lines()))
         .chain(upstream_file_text.iter().flat_map(|text| text.lines()))
         .collect();
     let upstream_config = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {
@@ -438,6 +452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 doh_auth_file_text
                     .iter()
                     .flat_map(|text| text.lines())
+                    .map(str::trim)
                     .filter(|line| !line.is_empty() && !line.starts_with('#')),
             )
             .map(doh_upstream::Credentials::parse_pair)

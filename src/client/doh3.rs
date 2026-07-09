@@ -251,7 +251,7 @@ pub async fn probe_h3(
 async fn probe_tls(addr: SocketAddr, server_name: &str) -> Result<(), DohError> {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
-        .map_err(|e| DohError::Io(e))?;
+        .map_err(DohError::Io)?;
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

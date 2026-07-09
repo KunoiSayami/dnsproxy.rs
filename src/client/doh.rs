@@ -147,10 +147,10 @@ impl DohUpstream {
 
         let start = Instant::now();
         let client = self.create_client().await?;
-        if let Some(t) = self.timeout {
-            if start.elapsed() > t {
-                return Err(DohError::Timeout(start.elapsed()));
-            }
+        if let Some(t) = self.timeout
+            && start.elapsed() > t
+        {
+            return Err(DohError::Timeout(start.elapsed()));
         }
 
         *guard = Some(client.clone());

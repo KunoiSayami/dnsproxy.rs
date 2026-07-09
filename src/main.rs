@@ -338,7 +338,10 @@ impl Args {
     /// Resolves the effective set of addresses to listen on: `--listen`
     /// verbatim (possibly repeated), `--port` expanded to the IPv4 and IPv6
     /// wildcard addresses, or the default of `127.0.0.1:53` when neither was
-    /// given.
+    /// given and no secure listener (`--quic-listen`/`--quic-port`,
+    /// `--tls-listen`/`--tls-port`, `--https-listen`/`--https-port`) is
+    /// enabled either, in which case the plain DNS listener is skipped
+    /// unless explicitly requested.
     fn listen_addrs(&self) -> Vec<SocketAddr> {
         if let Some(port) = self.port {
             return vec![
@@ -349,7 +352,35 @@ impl Args {
         if !self.listen.is_empty() {
             return self.listen.clone();
         }
+        if self.secure_listener_enabled() {
+            return Vec::new();
+        }
         vec![SocketAddr::from(([127, 0, 0, 1], 53))]
+    }
+
+    /// Whether any of the secure listeners (DoQ, DoT, DoH/DoH3) were
+    /// requested via `--*-listen` or `--*-port`.
+    #[cfg_attr(
+        not(any(feature = "doq-server", feature = "dot-server", feature = "doh-server")),
+        allow(clippy::unused_self)
+    )]
+    fn secure_listener_enabled(&self) -> bool {
+        #[cfg(feature = "doq-server")]
+        let quic = !self.quic_listen.is_empty() || self.quic_port.is_some();
+        #[cfg(not(feature = "doq-server"))]
+        let quic = false;
+
+        #[cfg(feature = "dot-server")]
+        let tls = !self.tls_listen.is_empty() || self.tls_port.is_some();
+        #[cfg(not(feature = "dot-server"))]
+        let tls = false;
+
+        #[cfg(feature = "doh-server")]
+        let https = !self.https_listen.is_empty() || self.https_port.is_some();
+        #[cfg(not(feature = "doh-server"))]
+        let https = false;
+
+        quic || tls || https
     }
 }
 
@@ -357,6 +388,18 @@ impl Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     init_log(args.verbose, &args.log_level, args.no_timestamp);
+
+    tracing::info!(
+        upstream = ?args.upstreams,
+        upstream_file = ?args.upstream_file,
+        bootstrap = ?args.bootstrap,
+        private_upstream = ?args.private_upstream,
+        insecure = args.insecure,
+        prefer_ipv6 = args.prefer_ipv6,
+        cache = args.cache,
+        timeout = args.timeout,
+        "startup config"
+    );
 
     install_crypto_provider();
 

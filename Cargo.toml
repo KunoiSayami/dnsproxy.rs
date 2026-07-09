@@ -19,9 +19,10 @@ tokio = { version = "1", features = [
     "sync",
     "macros",
 ] }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = [
     "client-legacy",
+    "server-auto",
     "tokio",
     "http1",
     "http2",
@@ -39,6 +40,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ], optional = true }
 rustls-pki-types = "1"
+rustls-pemfile = { version = "2", optional = true }
 webpki-roots = "1"
 base64 = "0.22"
 thiserror = "2"
@@ -57,12 +59,6 @@ http = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = [
-    "server-auto",
-    "tokio",
-    "http1",
-    "http2",
-] }
 rcgen = "0.14"
 
 [features]
@@ -70,6 +66,16 @@ default = ["http3", "dot", "doq", "crypto-ring"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:http"]
 dot = ["dep:rustls"]
 doq = ["dep:quinn", "dep:rustls"]
+
+# Reverse (server-side) listeners: this program acts as the receiver for
+# downstream clients, forwarding what it receives to the configured
+# upstream(s) via the same Handler the plain UDP/TCP listener uses. Each is
+# independently toggleable from its client-side counterpart above.
+doq-server = ["doq", "dep:rustls-pemfile"]
+dot-server = ["dot", "dep:rustls-pemfile"]
+doh-server = ["dep:rustls", "dep:rustls-pemfile"]
+http3-server = ["http3", "doh-server"]
+all-server = ["doq-server", "dot-server", "doh-server", "http3-server"]
 
 # Exactly one of these must be enabled; main.rs enforces this at compile time.
 # ring is the pure-Rust backend (smaller binary, no C toolchain required).

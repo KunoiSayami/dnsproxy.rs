@@ -39,6 +39,28 @@ pub fn decode_response(body: &[u8], req: &Message, original_id: u16) -> Result<M
     Ok(resp)
 }
 
+/// Decodes a DoH request body: raw DNS wireformat bytes (the RFC 8484 POST
+/// form) or, if `dns_param` is given instead (the GET form's `dns` query
+/// parameter), its base64url decoding. Used by DoH/DoH3 listeners; the
+/// mirror image of [`encode_request`], which the DoH client uses instead.
+pub fn decode_request(dns_param: Option<&str>, body: &[u8]) -> Result<Message, DohError> {
+    let bytes = match dns_param {
+        Some(param) => URL_SAFE_NO_PAD
+            .decode(param)
+            .map_err(|e| DohError::InvalidResponse(format!("decoding dns param: {e}")))?,
+        None => body.to_vec(),
+    };
+    Message::from_bytes(&bytes)
+        .map_err(|e| DohError::InvalidResponse(format!("unpacking doh request: {e}")))
+}
+
+/// Encodes a DoH response as raw DNS wireformat bytes, for the
+/// `application/dns-message` response body. The mirror image of
+/// [`decode_response`], which the DoH client uses instead.
+pub fn encode_response(resp: &Message) -> Result<Vec<u8>, DohError> {
+    Ok(resp.to_bytes()?)
+}
+
 /// Formats a `host:port` authority for display, bracketing `host` if it's a
 /// literal IPv6 address (e.g. `[::1]:53` rather than the ambiguous
 /// `::1:53`).

@@ -11,3 +11,4 @@ target/
 
 config/*
 !config/*.default
+*.upstream

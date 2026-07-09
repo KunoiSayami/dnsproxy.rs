@@ -21,6 +21,16 @@ pub mod options;
 pub mod plain_tcp;
 pub mod plain_udp;
 pub mod server;
+#[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+pub mod server_tls;
+#[cfg(feature = "http3-server")]
+pub mod serverhttp3;
+#[cfg(feature = "doh-server")]
+pub mod serverhttps;
+#[cfg(feature = "doq-server")]
+pub mod serverquic;
+#[cfg(feature = "dot-server")]
+pub mod servertls;
 pub mod upstream;
 pub mod upstream_config;
 pub mod upstream_url;

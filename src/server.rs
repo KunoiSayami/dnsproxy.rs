@@ -66,7 +66,11 @@ pub async fn serve_all(addrs: &[SocketAddr], handler: Handler) -> Result<(), Doh
 
 /// Builds a `socket2::Socket` for `addr`, setting `IPV6_V6ONLY` on IPv6
 /// sockets so IPv4 and IPv6 wildcard binds don't collide.
-fn new_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Socket> {
+pub(crate) fn new_socket(
+    addr: SocketAddr,
+    ty: Type,
+    protocol: Protocol,
+) -> std::io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
     } else {
@@ -87,7 +91,7 @@ fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
-fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
+pub(crate) fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = new_socket(addr, Type::STREAM, Protocol::TCP)?;
     socket.listen(1024)?;
     TcpListener::from_std(socket.into())
@@ -180,7 +184,11 @@ async fn handle_tcp_connection(
 
 /// Reads a DNS message prefixed with its 2-byte big-endian length, per
 /// RFC 1035 section 4.2.2. Mirrors `readPrefixed` in `proxy/servertcp.go`.
-async fn read_prefixed(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, DohError> {
+/// Generic over the stream type so it's reusable for TLS-wrapped connections
+/// (e.g. a DoT listener), not just a raw `TcpStream`.
+pub(crate) async fn read_prefixed<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<Vec<u8>, DohError> {
     let len = stream.read_u16().await?;
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
@@ -188,7 +196,10 @@ async fn read_prefixed(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, Do
 }
 
 /// Mirrors `writePrefixed` in `proxy/servertcp.go`.
-async fn write_prefixed(stream: &mut tokio::net::TcpStream, body: &[u8]) -> Result<(), DohError> {
+pub(crate) async fn write_prefixed<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    body: &[u8],
+) -> Result<(), DohError> {
     stream.write_u16(body.len() as u16).await?;
     stream.write_all(body).await?;
     Ok(())

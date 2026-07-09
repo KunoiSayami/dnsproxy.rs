@@ -176,6 +176,58 @@ struct Args {
     /// e.g. --private-upstream udp://127.0.0.1:53.
     #[arg(long)]
     private_upstream: Option<String>,
+
+    /// Address to listen on for DNS-over-QUIC (RFC 9250). May be repeated.
+    /// Requires --tls-cert and --tls-key.
+    #[cfg(feature = "doq-server")]
+    #[arg(long, conflicts_with = "quic_port")]
+    quic_listen: Vec<SocketAddr>,
+
+    /// Listen on this port for DNS-over-QUIC, on both the IPv4 and IPv6
+    /// wildcard addresses. Shorthand for --quic-listen 0.0.0.0:<port>
+    /// --quic-listen [::]:<port>.
+    #[cfg(feature = "doq-server")]
+    #[arg(long, conflicts_with = "quic_listen")]
+    quic_port: Option<u16>,
+
+    /// Address to listen on for DNS-over-TLS (RFC 7858). May be repeated.
+    /// Requires --tls-cert and --tls-key.
+    #[cfg(feature = "dot-server")]
+    #[arg(long, conflicts_with = "tls_port")]
+    tls_listen: Vec<SocketAddr>,
+
+    /// Listen on this port for DNS-over-TLS, on both the IPv4 and IPv6
+    /// wildcard addresses. Shorthand for --tls-listen 0.0.0.0:<port>
+    /// --tls-listen [::]:<port>.
+    #[cfg(feature = "dot-server")]
+    #[arg(long, conflicts_with = "tls_listen")]
+    tls_port: Option<u16>,
+
+    /// Address to listen on for DNS-over-HTTPS (RFC 8484). May be repeated.
+    /// Also serves HTTP/3, on the same addresses, if the http3-server
+    /// feature is enabled. Requires --tls-cert and --tls-key.
+    #[cfg(feature = "doh-server")]
+    #[arg(long, conflicts_with = "https_port")]
+    https_listen: Vec<SocketAddr>,
+
+    /// Listen on this port for DNS-over-HTTPS, on both the IPv4 and IPv6
+    /// wildcard addresses. Shorthand for --https-listen 0.0.0.0:<port>
+    /// --https-listen [::]:<port>.
+    #[cfg(feature = "doh-server")]
+    #[arg(long, conflicts_with = "https_listen")]
+    https_port: Option<u16>,
+
+    /// TLS certificate chain (PEM), for any of --quic-listen/--quic-port,
+    /// --tls-listen/--tls-port, or --https-listen/--https-port. Shared by
+    /// all enabled listeners.
+    #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+    #[arg(long, requires = "listener_tls_key")]
+    listener_tls_cert: Option<PathBuf>,
+
+    /// TLS private key (PEM), paired with --listener-tls-cert.
+    #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+    #[arg(long = "tls-key", requires = "listener_tls_cert")]
+    listener_tls_key: Option<PathBuf>,
 }
 
 /// The standard reverse-DNS zones for RFC 1918 private and RFC 6303
@@ -246,6 +298,22 @@ fn parse_bootstrap(s: &str, doh_opts: &Options) -> Result<Arc<dyn Resolver>, Str
         )));
     }
     Err(format!("invalid bootstrap address: {s}"))
+}
+
+/// Expands a `--*-listen`/`--*-port` flag pair into the effective set of
+/// addresses to listen on: `listen` verbatim (possibly repeated), or `port`
+/// expanded to the IPv4 and IPv6 wildcard addresses. Empty (rather than
+/// defaulting to any address) when neither was given, since these listeners
+/// are opt-in unlike the always-on plain DNS listener.
+#[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+fn expand_listen(listen: &[SocketAddr], port: Option<u16>) -> Vec<SocketAddr> {
+    if let Some(port) = port {
+        return vec![
+            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
+            SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port),
+        ];
+    }
+    listen.to_vec()
 }
 
 impl Args {
@@ -349,7 +417,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(size = args.cache_size, "caching enabled");
         handler = Arc::new(Cache::new(cache_opts)).into_handler(handler);
     }
-    doh_upstream::serve_all(&listen_addrs, handler).await?;
+    doh_upstream::serve_all(&listen_addrs, handler.clone()).await?;
+
+    #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+    {
+        let quic_addrs = {
+            #[cfg(feature = "doq-server")]
+            {
+                expand_listen(&args.quic_listen, args.quic_port)
+            }
+            #[cfg(not(feature = "doq-server"))]
+            {
+                Vec::<SocketAddr>::new()
+            }
+        };
+        let tls_addrs = {
+            #[cfg(feature = "dot-server")]
+            {
+                expand_listen(&args.tls_listen, args.tls_port)
+            }
+            #[cfg(not(feature = "dot-server"))]
+            {
+                Vec::<SocketAddr>::new()
+            }
+        };
+        let https_addrs = {
+            #[cfg(feature = "doh-server")]
+            {
+                expand_listen(&args.https_listen, args.https_port)
+            }
+            #[cfg(not(feature = "doh-server"))]
+            {
+                Vec::<SocketAddr>::new()
+            }
+        };
+
+        if !quic_addrs.is_empty() || !tls_addrs.is_empty() || !https_addrs.is_empty() {
+            let cert = args.listener_tls_cert.as_ref().ok_or(
+                "--tls-cert is required to enable any of --quic-listen/--tls-listen/--https-listen",
+            )?;
+            let key = args
+                .listener_tls_key
+                .as_ref()
+                .ok_or("--tls-key is required")?;
+
+            #[cfg(feature = "doq-server")]
+            if !quic_addrs.is_empty() {
+                let tls_config = doh_upstream::server_tls::load_server_tls_config(
+                    cert,
+                    key,
+                    vec![doh_upstream::serverquic::DOQ_ALPN.to_vec()],
+                )?;
+                tracing::info!(listen = ?quic_addrs, "doq listening");
+                doh_upstream::serverquic::serve_all(
+                    &quic_addrs,
+                    Arc::new(tls_config),
+                    handler.clone(),
+                )
+                .await?;
+            }
+
+            #[cfg(feature = "dot-server")]
+            if !tls_addrs.is_empty() {
+                let tls_config =
+                    doh_upstream::server_tls::load_server_tls_config(cert, key, vec![])?;
+                tracing::info!(listen = ?tls_addrs, "dot listening");
+                doh_upstream::servertls::serve_all(
+                    &tls_addrs,
+                    Arc::new(tls_config),
+                    handler.clone(),
+                )
+                .await?;
+            }
+
+            #[cfg(feature = "doh-server")]
+            if !https_addrs.is_empty() {
+                #[cfg_attr(not(feature = "http3-server"), allow(unused_mut))]
+                let mut alpn: Vec<Vec<u8>> = doh_upstream::serverhttps::DOH_ALPN
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect();
+                #[cfg(feature = "http3-server")]
+                alpn.extend(
+                    doh_upstream::serverhttp3::DOH3_ALPN
+                        .iter()
+                        .map(|p| p.to_vec()),
+                );
+                let tls_config = doh_upstream::server_tls::load_server_tls_config(cert, key, alpn)?;
+                let tls_config = Arc::new(tls_config);
+                tracing::info!(listen = ?https_addrs, "doh listening");
+                doh_upstream::serverhttps::serve_all(
+                    &https_addrs,
+                    Arc::clone(&tls_config),
+                    handler.clone(),
+                )
+                .await?;
+
+                #[cfg(feature = "http3-server")]
+                {
+                    tracing::info!(listen = ?https_addrs, "doh3 listening");
+                    doh_upstream::serverhttp3::serve_all(&https_addrs, tls_config, handler.clone())
+                        .await?;
+                }
+            }
+        }
+    }
 
     // `serve` spawns its listeners and returns once bound; block forever so
     // the process keeps running them.

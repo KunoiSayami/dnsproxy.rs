@@ -10,11 +10,11 @@ use bytes::{Buf, Bytes};
 use h3::server::RequestStream;
 use http::{Method, Request, Response, StatusCode};
 
-use crate::doh_auth::Credentials;
+use crate::client::wire::{decode_request, encode_response};
 use crate::error::DohError;
-use crate::server::Handler;
-use crate::serverhttps::find_dns_param;
-use crate::wire::{decode_request, encode_response};
+use crate::listener::doh::find_dns_param;
+use crate::listener::doh_auth::Credentials;
+use crate::listener::io::Handler;
 
 const MAX_MSG_SIZE: usize = 65535;
 
@@ -285,7 +285,9 @@ mod tests {
             Some(addr.port()),
             "/dns-query",
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 http_versions: vec![HttpVersion::Http3],
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
@@ -318,7 +320,9 @@ mod tests {
             Some(addr.port()),
             "/dns-query",
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 http_versions: vec![HttpVersion::Http3],
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,

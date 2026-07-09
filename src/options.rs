@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bootstrap::Resolver;
+use crate::client::bootstrap::Resolver;
 
 /// HTTP protocol versions the DoH client may negotiate, doubling as the ALPN
 /// values advertised during the TLS handshake.
@@ -28,7 +28,7 @@ pub fn default_http_versions() -> Vec<HttpVersion> {
     vec![HttpVersion::Http11, HttpVersion::Http2]
 }
 
-/// Configuration for a DoH [`crate::doh::DohUpstream`].
+/// Configuration for a DoH [`crate::client::doh::DohUpstream`].
 pub struct Options {
     /// Resolver used to bootstrap the DoH server's hostname. Defaults to the
     /// system resolver if `None`.

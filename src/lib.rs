@@ -7,50 +7,21 @@
 //! behind the `http3` feature and races a QUIC handshake against TLS to
 //! decide whether to prefer it, matching the Go client's probing behavior.
 
-pub mod bootstrap;
 pub mod cache;
-pub mod doh;
-#[cfg(feature = "http3")]
-pub mod doh3;
-#[cfg(feature = "doh-server")]
-pub mod doh_auth;
-#[cfg(feature = "doq")]
-pub mod doq;
-#[cfg(feature = "dot")]
-pub mod dot;
+pub mod client;
 pub mod error;
+pub mod listener;
 pub mod options;
-pub mod plain_tcp;
-pub mod plain_udp;
-pub mod server;
-#[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
-pub mod server_tls;
-#[cfg(feature = "http3-server")]
-pub mod serverhttp3;
-#[cfg(feature = "doh-server")]
-pub mod serverhttps;
-#[cfg(feature = "doq-server")]
-pub mod serverquic;
-#[cfg(feature = "dot-server")]
-pub mod servertls;
-pub mod upstream;
-pub mod upstream_config;
-pub mod upstream_url;
-pub mod wire;
 
 pub use cache::{Cache, CacheOptions};
-pub use doh::DohUpstream;
-#[cfg(feature = "doh-server")]
-pub use doh_auth::Credentials;
+pub use client::DohUpstream;
 #[cfg(feature = "doq")]
-pub use doq::DoqUpstream;
+pub use client::DoqUpstream;
 #[cfg(feature = "dot")]
-pub use dot::DotUpstream;
+pub use client::DotUpstream;
+pub use client::{PlainTcpUpstream, PlainUdpUpstream, Upstream, UpstreamConfig, parse_upstream};
 pub use error::DohError;
+#[cfg(feature = "doh-server")]
+pub use listener::Credentials;
+pub use listener::{Handler, serve, serve_all};
 pub use options::{HttpVersion, Options};
-pub use plain_tcp::PlainTcpUpstream;
-pub use plain_udp::PlainUdpUpstream;
-pub use server::{Handler, serve, serve_all};
-pub use upstream::Upstream;
-pub use upstream_config::UpstreamConfig;
-pub use upstream_url::parse_upstream;

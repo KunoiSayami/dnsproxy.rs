@@ -11,9 +11,9 @@ use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::Mutex;
 
-use crate::bootstrap::{Resolver, SystemResolver, resolve_addrs};
+use crate::client::bootstrap::{Resolver, SystemResolver, resolve_addrs};
+use crate::client::wire::{format_host_port, validate_response};
 use crate::error::DohError;
-use crate::wire::{format_host_port, validate_response};
 
 const DEFAULT_PORT_DOQ: u16 = 853;
 const MAX_MSG_SIZE: usize = 65535;
@@ -168,7 +168,7 @@ impl DoqUpstream {
             .first()
             .ok_or_else(|| DohError::Bootstrap(format!("no addresses for {}", self.host)))?;
 
-        let tls_config = crate::doh::build_tls_config(
+        let tls_config = crate::client::doh::build_tls_config(
             &self.host,
             self.insecure_skip_verify,
             vec![DOQ_ALPN.to_vec()],
@@ -271,7 +271,9 @@ mod tests {
             "localhost",
             Some(addr.port()),
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()

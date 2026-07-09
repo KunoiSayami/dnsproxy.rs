@@ -10,11 +10,11 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bootstrap::{Network, Resolver, SystemResolver, resolve_dial_context};
-use crate::doh::build_tls_config;
+use crate::client::bootstrap::{Network, Resolver, SystemResolver, resolve_dial_context};
+use crate::client::doh::build_tls_config;
+use crate::client::wire::{format_host_port, validate_response};
 use crate::error::DohError;
 use crate::options::Options;
-use crate::wire::{format_host_port, validate_response};
 
 const DEFAULT_PORT_DOT: u16 = 853;
 
@@ -69,8 +69,8 @@ impl DotUpstream {
 
             let conn = (dial)(Network::Tcp).await?;
             let tcp = match conn {
-                crate::bootstrap::Conn::Tcp(s) => s,
-                crate::bootstrap::Conn::Udp(..) => {
+                crate::client::bootstrap::Conn::Tcp(s) => s,
+                crate::client::bootstrap::Conn::Udp(..) => {
                     return Err(DohError::Bootstrap("expected tcp connection".into()));
                 }
             };
@@ -169,7 +169,9 @@ mod tests {
             "localhost",
             Some(addr.port()),
             Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()

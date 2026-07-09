@@ -12,7 +12,7 @@ use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
-use crate::doh::DohUpstream;
+use crate::client::doh::DohUpstream;
 use crate::error::DohError;
 
 /// Network type used when dialing.

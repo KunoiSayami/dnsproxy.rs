@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::error::DohError;
-use crate::server::{Handler, bind_tcp, read_prefixed, write_prefixed};
+use crate::listener::io::{Handler, bind_tcp, read_prefixed, write_prefixed};
 
 /// Runs a DoT listener on every address in `addrs`, dispatching every
 /// decoded query to `handler`. Returns once every listener is bound; the
@@ -143,7 +143,9 @@ mod tests {
             "localhost",
             Some(addr.port()),
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()

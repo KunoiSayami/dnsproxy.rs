@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use hickory_proto::op::Message;
 
+use crate::client::upstream::Upstream;
+use crate::client::upstream_url::parse_any_upstream;
 use crate::error::DohError;
+use crate::listener::io::Handler;
 use crate::options::Options;
-use crate::server::Handler;
-use crate::upstream::Upstream;
-use crate::upstream_url::parse_any_upstream;
 
 /// A separator between labels of a domain name.
 const LABEL_SEP: char = '.';

@@ -9,9 +9,9 @@ use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bootstrap::{Network, Resolver, SystemResolver, resolve_dial_context};
+use crate::client::bootstrap::{Network, Resolver, SystemResolver, resolve_dial_context};
+use crate::client::wire::{format_host_port, validate_response};
 use crate::error::DohError;
-use crate::wire::{format_host_port, validate_response};
 
 const DEFAULT_PORT_PLAIN: u16 = 53;
 
@@ -67,8 +67,8 @@ impl PlainTcpUpstream {
 
             let conn = (dial)(Network::Tcp).await?;
             let mut tcp = match conn {
-                crate::bootstrap::Conn::Tcp(s) => s,
-                crate::bootstrap::Conn::Udp(..) => {
+                crate::client::bootstrap::Conn::Tcp(s) => s,
+                crate::client::bootstrap::Conn::Udp(..) => {
                     return Err(DohError::Bootstrap("expected tcp connection".into()));
                 }
             };

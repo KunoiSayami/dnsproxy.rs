@@ -10,8 +10,8 @@ use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::UdpSocket;
 
+use crate::client::wire::validate_response;
 use crate::error::DohError;
-use crate::wire::validate_response;
 
 const MAX_MSG_SIZE: usize = 65535;
 

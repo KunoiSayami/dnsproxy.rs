@@ -1,20 +1,20 @@
 //! An upstream DNS server reachable over DoH/DoH3, DoT, DoQ, or plain
 //! DNS-over-UDP/TCP, unifying [`DohUpstream`], [`DotUpstream`],
 //! [`DoqUpstream`], [`PlainUdpUpstream`], and [`PlainTcpUpstream`] behind one
-//! type so [`crate::upstream_config::UpstreamConfig`] can mix all of them.
+//! type so [`crate::client::upstream_config::UpstreamConfig`] can mix all of them.
 
 use std::sync::Arc;
 
 use hickory_proto::op::Message;
 
-use crate::doh::DohUpstream;
+use crate::client::doh::DohUpstream;
 #[cfg(feature = "doq")]
-use crate::doq::DoqUpstream;
+use crate::client::doq::DoqUpstream;
 #[cfg(feature = "dot")]
-use crate::dot::DotUpstream;
+use crate::client::dot::DotUpstream;
+use crate::client::plain_tcp::PlainTcpUpstream;
+use crate::client::plain_udp::PlainUdpUpstream;
 use crate::error::DohError;
-use crate::plain_tcp::PlainTcpUpstream;
-use crate::plain_udp::PlainUdpUpstream;
 
 /// A configured upstream DNS server, over DoH/DoH3, DoT, DoQ, plain UDP, or
 /// plain TCP.

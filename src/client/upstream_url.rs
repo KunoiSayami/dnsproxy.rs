@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use hyper::Uri;
 
-use crate::doh::DohUpstream;
+use crate::client::doh::DohUpstream;
 #[cfg(feature = "doq")]
-use crate::doq::DoqUpstream;
+use crate::client::doq::DoqUpstream;
 #[cfg(feature = "dot")]
-use crate::dot::DotUpstream;
+use crate::client::dot::DotUpstream;
+use crate::client::plain_tcp::PlainTcpUpstream;
+use crate::client::plain_udp::PlainUdpUpstream;
+use crate::client::upstream::Upstream;
 use crate::options::{HttpVersion, Options};
-use crate::plain_tcp::PlainTcpUpstream;
-use crate::plain_udp::PlainUdpUpstream;
-use crate::upstream::Upstream;
 
 /// Default port for plain DNS, matching Go's `defaultPortPlain`.
 const DEFAULT_PORT_PLAIN: u16 = 53;

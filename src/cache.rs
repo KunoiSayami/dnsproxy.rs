@@ -1,4 +1,4 @@
-//! An in-memory, TTL-aware response cache, wrapping a [`crate::server::Handler`]
+//! An in-memory, TTL-aware response cache, wrapping a [`crate::listener::io::Handler`]
 //! so callers can add caching to any upstream without changing the query
 //! handling path in `server.rs`. Mirrors the gist of `proxy/cache.go` (cache
 //! by question, minimum-TTL storage, decrementing TTLs on hits) without its
@@ -13,7 +13,7 @@ use hickory_proto::rr::{DNSClass, Name, RecordType};
 use lru::LruCache;
 use tokio::sync::Mutex;
 
-use crate::server::Handler;
+use crate::listener::io::Handler;
 
 /// Caching options, set from `--cache-size`, `--cache-min-ttl`, and
 /// `--cache-max-ttl`.

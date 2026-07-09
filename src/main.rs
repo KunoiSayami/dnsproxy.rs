@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use doh_upstream::bootstrap::{DohResolver, ParallelResolver, PlainResolver, Resolver};
+use doh_upstream::client::bootstrap::{DohResolver, ParallelResolver, PlainResolver, Resolver};
 use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig, parse_upstream};
 
 #[cfg(all(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
@@ -504,13 +504,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(feature = "doq-server")]
             if !quic_addrs.is_empty() {
-                let tls_config = doh_upstream::server_tls::load_server_tls_config(
+                let tls_config = doh_upstream::listener::tls_config::load_server_tls_config(
                     cert,
                     key,
-                    vec![doh_upstream::serverquic::DOQ_ALPN.to_vec()],
+                    vec![doh_upstream::listener::doq::DOQ_ALPN.to_vec()],
                 )?;
                 tracing::info!(listen = ?quic_addrs, "doq listening");
-                doh_upstream::serverquic::serve_all(
+                doh_upstream::listener::doq::serve_all(
                     &quic_addrs,
                     Arc::new(tls_config),
                     handler.clone(),
@@ -521,9 +521,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "dot-server")]
             if !tls_addrs.is_empty() {
                 let tls_config =
-                    doh_upstream::server_tls::load_server_tls_config(cert, key, vec![])?;
+                    doh_upstream::listener::tls_config::load_server_tls_config(cert, key, vec![])?;
                 tracing::info!(listen = ?tls_addrs, "dot listening");
-                doh_upstream::servertls::serve_all(
+                doh_upstream::listener::dot::serve_all(
                     &tls_addrs,
                     Arc::new(tls_config),
                     handler.clone(),
@@ -534,20 +534,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "doh-server")]
             if !https_addrs.is_empty() {
                 #[cfg_attr(not(feature = "http3-server"), allow(unused_mut))]
-                let mut alpn: Vec<Vec<u8>> = doh_upstream::serverhttps::DOH_ALPN
+                let mut alpn: Vec<Vec<u8>> = doh_upstream::listener::doh::DOH_ALPN
                     .iter()
                     .map(|p| p.to_vec())
                     .collect();
                 #[cfg(feature = "http3-server")]
                 alpn.extend(
-                    doh_upstream::serverhttp3::DOH3_ALPN
+                    doh_upstream::listener::doh3::DOH3_ALPN
                         .iter()
                         .map(|p| p.to_vec()),
                 );
-                let tls_config = doh_upstream::server_tls::load_server_tls_config(cert, key, alpn)?;
+                let tls_config =
+                    doh_upstream::listener::tls_config::load_server_tls_config(cert, key, alpn)?;
                 let tls_config = Arc::new(tls_config);
                 tracing::info!(listen = ?https_addrs, "doh listening");
-                doh_upstream::serverhttps::serve_all(
+                doh_upstream::listener::doh::serve_all(
                     &https_addrs,
                     Arc::clone(&tls_config),
                     handler.clone(),
@@ -558,7 +559,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(feature = "http3-server")]
                 {
                     tracing::info!(listen = ?https_addrs, "doh3 listening");
-                    doh_upstream::serverhttp3::serve_all(
+                    doh_upstream::listener::doh3::serve_all(
                         &https_addrs,
                         tls_config,
                         handler.clone(),

@@ -9,7 +9,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::net::SocketAddr;
 
 use crate::error::DohError;
-use crate::server::Handler;
+use crate::listener::io::Handler;
 
 const MAX_MSG_SIZE: usize = 65535;
 pub const DOQ_ALPN: &[u8] = b"doq";
@@ -187,7 +187,9 @@ mod tests {
             "localhost",
             Some(addr.port()),
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()
@@ -216,7 +218,7 @@ mod tests {
         .unwrap();
 
         let mut client_tls =
-            crate::doh::build_tls_config("localhost", true, vec![DOQ_ALPN.to_vec()]);
+            crate::client::doh::build_tls_config("localhost", true, vec![DOQ_ALPN.to_vec()]);
         client_tls.alpn_protocols = vec![DOQ_ALPN.to_vec()];
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let client_config = quinn::ClientConfig::new(Arc::new(

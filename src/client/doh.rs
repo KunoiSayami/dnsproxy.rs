@@ -17,11 +17,11 @@ use tokio::sync::Mutex;
 use hickory_proto::op::Message;
 
 #[cfg(feature = "http3")]
-use crate::bootstrap::resolve_addrs;
-use crate::bootstrap::{Resolver, SystemResolver, resolve_dial_context};
+use crate::client::bootstrap::resolve_addrs;
+use crate::client::bootstrap::{Resolver, SystemResolver, resolve_dial_context};
+use crate::client::wire::{decode_response, encode_request};
 use crate::error::DohError;
 use crate::options::{HttpVersion, Options};
-use crate::wire::{decode_response, encode_request};
 
 const DEFAULT_PORT_DOH: u16 = 443;
 const MAX_MSG_SIZE: usize = 65535;
@@ -29,7 +29,7 @@ const MAX_MSG_SIZE: usize = 65535;
 /// A DNS-over-HTTPS upstream client (RFC 8484), supporting HTTP/1.1 and
 /// HTTP/2 always, and HTTP/3 behind the `http3` feature: mirrors Go's
 /// `dnsOverHTTPS`, racing a QUIC handshake against TLS (via
-/// [`crate::doh3::probe_h3`]) to decide which to use, unless the upstream
+/// [`crate::client::doh3::probe_h3`]) to decide which to use, unless the upstream
 /// only advertises HTTP/3.
 pub struct DohUpstream {
     host: String,
@@ -45,7 +45,7 @@ pub struct DohUpstream {
 
     client: Mutex<Option<Client<HttpsConnector, Empty<Bytes>>>>,
     #[cfg(feature = "http3")]
-    h3: Mutex<Option<Arc<crate::doh3::Http3Transport>>>,
+    h3: Mutex<Option<Arc<crate::client::doh3::Http3Transport>>>,
     /// Cached result of racing HTTP/3 against HTTP/2 (mirrors Go caching
     /// `probeH3`'s outcome on the upstream). `None` until the first
     /// exchange; irrelevant when [`Self::http_versions`] names only one of
@@ -96,10 +96,10 @@ impl DohUpstream {
         &self.addr_redacted
     }
 
-    /// Builds a [`crate::server::Handler`] that forwards every query it
+    /// Builds a [`crate::listener::io::Handler`] that forwards every query it
     /// receives to `self` and returns the upstream's response, turning a
-    /// [`crate::server::serve`] listener into a minimal DNS-to-DoH proxy.
-    pub fn into_handler(self: Arc<Self>) -> crate::server::Handler {
+    /// [`crate::listener::io::serve`] listener into a minimal DNS-to-DoH proxy.
+    pub fn into_handler(self: Arc<Self>) -> crate::listener::io::Handler {
         Arc::new(move |req: Message| {
             let upstream = Arc::clone(&self);
             Box::pin(async move { upstream.exchange(&req).await })
@@ -201,8 +201,14 @@ impl DohUpstream {
 
         let tls_config =
             build_tls_config(&self.host, self.insecure_skip_verify, vec![b"h2".to_vec()]);
-        let prefer =
-            crate::doh3::probe_h3(addr, &self.host, Arc::new(tls_config), self.timeout, true).await;
+        let prefer = crate::client::doh3::probe_h3(
+            addr,
+            &self.host,
+            Arc::new(tls_config),
+            self.timeout,
+            true,
+        )
+        .await;
 
         *self.prefer_h3.lock().await = Some(prefer);
         Ok(prefer)
@@ -228,7 +234,9 @@ impl DohUpstream {
     }
 
     #[cfg(feature = "http3")]
-    async fn get_h3_transport(&self) -> Result<(Arc<crate::doh3::Http3Transport>, bool), DohError> {
+    async fn get_h3_transport(
+        &self,
+    ) -> Result<(Arc<crate::client::doh3::Http3Transport>, bool), DohError> {
         let mut guard = self.h3.lock().await;
         if let Some(t) = guard.as_ref() {
             return Ok((Arc::clone(t), true));
@@ -248,7 +256,7 @@ impl DohUpstream {
 
         let tls_config =
             build_tls_config(&self.host, self.insecure_skip_verify, vec![b"h3".to_vec()]);
-        let transport = Arc::new(crate::doh3::Http3Transport::new(
+        let transport = Arc::new(crate::client::doh3::Http3Transport::new(
             addr,
             self.host.clone(),
             Arc::new(tls_config),
@@ -452,11 +460,11 @@ mod danger {
 }
 
 /// A `hyper` connector that dials only the addresses resolved at
-/// bootstrap-time (via [`crate::bootstrap::DialHandler`]) and wraps the
+/// bootstrap-time (via [`crate::client::bootstrap::DialHandler`]) and wraps the
 /// connection in TLS, negotiating HTTP/2 or HTTP/1.1 based on ALPN.
 #[derive(Clone)]
 struct HttpsConnector {
-    dial: crate::bootstrap::DialHandler,
+    dial: crate::client::bootstrap::DialHandler,
     tls_config: Arc<tokio_rustls::rustls::ClientConfig>,
     server_name: String,
 }
@@ -481,10 +489,10 @@ impl tower_service::Service<Uri> for HttpsConnector {
         let server_name = self.server_name.clone();
 
         Box::pin(async move {
-            let conn = (dial)(crate::bootstrap::Network::Tcp).await?;
+            let conn = (dial)(crate::client::bootstrap::Network::Tcp).await?;
             let tcp = match conn {
-                crate::bootstrap::Conn::Tcp(s) => s,
-                crate::bootstrap::Conn::Udp(..) => {
+                crate::client::bootstrap::Conn::Tcp(s) => s,
+                crate::client::bootstrap::Conn::Udp(..) => {
                     return Err(DohError::Http("expected tcp connection".into()));
                 }
             };

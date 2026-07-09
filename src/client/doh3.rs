@@ -14,8 +14,8 @@ use hickory_proto::op::Message;
 use http::Request;
 use tokio::sync::Mutex;
 
+use crate::client::wire::{decode_response, encode_request};
 use crate::error::DohError;
-use crate::wire::{decode_response, encode_request};
 
 const MAX_MSG_SIZE: usize = 65535;
 

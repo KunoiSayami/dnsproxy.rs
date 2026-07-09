@@ -16,10 +16,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio_rustls::TlsAcceptor;
 
-use crate::doh_auth::Credentials;
+use crate::client::wire::{decode_request, encode_response};
 use crate::error::DohError;
-use crate::server::{Handler, bind_tcp};
-use crate::wire::{decode_request, encode_response};
+use crate::listener::doh_auth::Credentials;
+use crate::listener::io::{Handler, bind_tcp};
 
 const MAX_MSG_SIZE: usize = 65535;
 pub const DOH_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
@@ -259,7 +259,9 @@ mod tests {
             Some(addr.port()),
             "/dns-query",
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()
@@ -291,7 +293,9 @@ mod tests {
             Some(addr.port()),
             "/dns-query",
             crate::options::Options {
-                bootstrap: Some(Arc::new(crate::bootstrap::StaticResolver(vec![addr.ip()]))),
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
                 timeout: Some(Duration::from_secs(5)),
                 insecure_skip_verify: true,
                 ..Default::default()

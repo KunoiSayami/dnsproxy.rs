@@ -166,6 +166,58 @@ struct Args {
     /// unbounded.
     #[arg(long, default_value_t = 0)]
     cache_max_ttl: u64,
+
+    /// Upstream for reverse-DNS (PTR) queries targeting private-use address
+    /// ranges (RFC 1918/6303: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+    /// 127.0.0.0/8, 169.254.0.0/16, and their IPv6 equivalents), same syntax
+    /// as one --upstream value. Takes precedence over --upstream/
+    /// --upstream-file rules for those ranges. Useful for pointing at a
+    /// local resolver like dnsmasq that knows real DHCP lease hostnames,
+    /// e.g. --private-upstream udp://127.0.0.1:53.
+    #[arg(long)]
+    private_upstream: Option<String>,
+}
+
+/// The standard reverse-DNS zones for RFC 1918 private and RFC 6303
+/// special-use address ranges, mirroring the zones `hickory_proto`'s
+/// `usage` module documents for the same ranges.
+const PRIVATE_REVERSE_ZONES: &[&str] = &[
+    // RFC 1918 IPv4 private-use ranges.
+    "10.in-addr.arpa",
+    "16.172.in-addr.arpa",
+    "17.172.in-addr.arpa",
+    "18.172.in-addr.arpa",
+    "19.172.in-addr.arpa",
+    "20.172.in-addr.arpa",
+    "21.172.in-addr.arpa",
+    "22.172.in-addr.arpa",
+    "23.172.in-addr.arpa",
+    "24.172.in-addr.arpa",
+    "25.172.in-addr.arpa",
+    "26.172.in-addr.arpa",
+    "27.172.in-addr.arpa",
+    "28.172.in-addr.arpa",
+    "29.172.in-addr.arpa",
+    "30.172.in-addr.arpa",
+    "31.172.in-addr.arpa",
+    "168.192.in-addr.arpa",
+    // RFC 6303 special-use ranges.
+    "127.in-addr.arpa",
+    "254.169.in-addr.arpa",
+    "c.f.ip6.arpa",
+    "d.f.ip6.arpa",
+    "8.e.f.ip6.arpa",
+    "9.e.f.ip6.arpa",
+    "a.e.f.ip6.arpa",
+    "b.e.f.ip6.arpa",
+    "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+];
+
+/// Builds a single `[/zone1/.../zoneN/]upstream` config line routing every
+/// private-use reverse-DNS zone to `upstream`.
+fn private_upstream_line(upstream: &str) -> String {
+    let zones = PRIVATE_REVERSE_ZONES.join("/");
+    format!("[/{zones}/]{upstream}")
 }
 
 /// Builds the [`Resolver`] for one `--bootstrap` value: a DoH/DoH3 URL
@@ -268,10 +320,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
         })
         .transpose()?;
-    let lines: Vec<&str> = args
-        .upstreams
+    let private_upstream_line = args.private_upstream.as_deref().map(private_upstream_line);
+    let lines: Vec<&str> = private_upstream_line
         .iter()
         .map(String::as_str)
+        .chain(args.upstreams.iter().map(String::as_str))
         .chain(upstream_file_text.iter().flat_map(|text| text.lines()))
         .collect();
     let upstream_config = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {

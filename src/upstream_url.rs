@@ -1,9 +1,9 @@
 //! Parses a single upstream address string into an [`Upstream`], mirroring
 //! the relevant subset of `AddressToUpstream`/`urlToUpstream` in Go's
 //! `upstream/upstream.go`: `https://`/`h3://` for DoH/DoH3, `tls://` for DoT
-//! (behind the `dot` feature), and `udp://`/`tcp://` (or a bare
-//! `host[:port]` with no scheme, which defaults to `udp://` just as in Go)
-//! for plain DNS-over-UDP/TCP.
+//! (behind the `dot` feature), `quic://` for DoQ (behind the `doq` feature),
+//! and `udp://`/`tcp://` (or a bare `host[:port]` with no scheme, which
+//! defaults to `udp://` just as in Go) for plain DNS-over-UDP/TCP.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use std::sync::Arc;
 use hyper::Uri;
 
 use crate::doh::DohUpstream;
+#[cfg(feature = "doq")]
+use crate::doq::DoqUpstream;
 #[cfg(feature = "dot")]
 use crate::dot::DotUpstream;
 use crate::options::{HttpVersion, Options};
@@ -141,10 +143,11 @@ fn split_host_port(rest: &str) -> Result<(String, Option<u16>), String> {
 /// Parses `addr` into an [`Upstream`], extending [`parse_upstream`] with
 /// `udp://host[:port]` (or a bare `host[:port]`/`host`, which defaults to
 /// `udp://` just as in Go's `AddressToUpstream`) for plain DNS-over-UDP,
-/// `tcp://host[:port]` for plain DNS-over-TCP, and `tls://host[:port]` for
-/// DoT (behind the `dot` feature). `udp://` upstreams must use a literal IP
-/// host, since this crate has no separate bootstrap step for them; `tcp://`
-/// and `tls://` may use a hostname.
+/// `tcp://host[:port]` for plain DNS-over-TCP, `tls://host[:port]` for DoT
+/// (behind the `dot` feature), and `quic://host[:port]` for DoQ (behind the
+/// `doq` feature). `udp://` upstreams must use a literal IP host, since this
+/// crate has no separate bootstrap step for them; the others may use a
+/// hostname.
 pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, String> {
     let (scheme, rest) = match addr.split_once("://") {
         Some((scheme, rest)) => (scheme, rest),
@@ -180,6 +183,15 @@ pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, S
         "tls" => {
             let (host, port) = split_host_port(rest)?;
             Ok(Upstream::Dot(Arc::new(DotUpstream::new(
+                &host,
+                port,
+                clone_opts(base_opts),
+            ))))
+        }
+        #[cfg(feature = "doq")]
+        "quic" => {
+            let (host, port) = split_host_port(rest)?;
+            Ok(Upstream::Doq(Arc::new(DoqUpstream::new(
                 &host,
                 port,
                 clone_opts(base_opts),
@@ -279,5 +291,19 @@ mod tests {
     fn parses_bracketed_ipv6_host() {
         let u = parse_any_upstream("tcp://[::1]:530", &Options::default()).unwrap();
         assert_eq!(u.address(), "tcp://[::1]:530");
+    }
+
+    #[cfg(feature = "doq")]
+    #[test]
+    fn parses_quic_scheme_upstream() {
+        let u = parse_any_upstream("quic://dns.google", &Options::default()).unwrap();
+        assert_eq!(u.address(), "quic://dns.google:853");
+    }
+
+    #[cfg(feature = "doq")]
+    #[test]
+    fn parses_quic_scheme_upstream_with_port() {
+        let u = parse_any_upstream("quic://1.1.1.1:8853", &Options::default()).unwrap();
+        assert_eq!(u.address(), "quic://1.1.1.1:8853");
     }
 }

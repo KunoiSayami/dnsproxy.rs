@@ -1,6 +1,7 @@
 //! A DNS upstream client, ported from AdGuard dnsproxy's Go implementation
 //! (`upstream/`). Supports DoH (RFC 8484), DoT (RFC 7858, behind the `dot`
-//! feature), and plain DNS-over-UDP/TCP.
+//! feature), DoQ (RFC 9250, behind the `doq` feature), and plain
+//! DNS-over-UDP/TCP.
 //!
 //! For DoH, HTTP/1.1 and HTTP/2 are supported always; HTTP/3 is available
 //! behind the `http3` feature and races a QUIC handshake against TLS to
@@ -11,6 +12,8 @@ pub mod cache;
 pub mod doh;
 #[cfg(feature = "http3")]
 pub mod doh3;
+#[cfg(feature = "doq")]
+pub mod doq;
 #[cfg(feature = "dot")]
 pub mod dot;
 pub mod error;
@@ -25,6 +28,8 @@ pub mod wire;
 
 pub use cache::{Cache, CacheOptions};
 pub use doh::DohUpstream;
+#[cfg(feature = "doq")]
+pub use doq::DoqUpstream;
 #[cfg(feature = "dot")]
 pub use dot::DotUpstream;
 pub use error::DohError;

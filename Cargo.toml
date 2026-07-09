@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
@@ -66,9 +66,10 @@ hyper-util = { version = "0.1", features = [
 rcgen = "0.14"
 
 [features]
-default = ["http3", "dot", "crypto-ring"]
+default = ["http3", "dot", "doq", "crypto-ring"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:http"]
 dot = ["dep:rustls"]
+doq = ["dep:quinn", "dep:rustls"]
 
 # Exactly one of these must be enabled; main.rs enforces this at compile time.
 # ring is the pure-Rust backend (smaller binary, no C toolchain required).

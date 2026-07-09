@@ -29,7 +29,7 @@ pub enum DohError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[cfg(feature = "http3")]
+    #[cfg(any(feature = "http3", feature = "doq"))]
     #[error("quic error: {0}")]
     Quic(String),
 }
@@ -40,7 +40,7 @@ impl DohError {
     pub fn should_retry(&self) -> bool {
         match self {
             DohError::Timeout(_) => true,
-            #[cfg(feature = "http3")]
+            #[cfg(any(feature = "http3", feature = "doq"))]
             DohError::Quic(msg) => msg.contains("0-RTT") || msg.contains("retry"),
             _ => false,
         }

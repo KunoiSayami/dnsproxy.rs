@@ -1,25 +1,29 @@
-//! An upstream DNS server reachable over DoH/DoH3, DoT, or plain
+//! An upstream DNS server reachable over DoH/DoH3, DoT, DoQ, or plain
 //! DNS-over-UDP/TCP, unifying [`DohUpstream`], [`DotUpstream`],
-//! [`PlainUdpUpstream`], and [`PlainTcpUpstream`] behind one type so
-//! [`crate::upstream_config::UpstreamConfig`] can mix all of them.
+//! [`DoqUpstream`], [`PlainUdpUpstream`], and [`PlainTcpUpstream`] behind one
+//! type so [`crate::upstream_config::UpstreamConfig`] can mix all of them.
 
 use std::sync::Arc;
 
 use hickory_proto::op::Message;
 
 use crate::doh::DohUpstream;
+#[cfg(feature = "doq")]
+use crate::doq::DoqUpstream;
 #[cfg(feature = "dot")]
 use crate::dot::DotUpstream;
 use crate::error::DohError;
 use crate::plain_tcp::PlainTcpUpstream;
 use crate::plain_udp::PlainUdpUpstream;
 
-/// A configured upstream DNS server, over DoH/DoH3, DoT, plain UDP, or plain
-/// TCP.
+/// A configured upstream DNS server, over DoH/DoH3, DoT, DoQ, plain UDP, or
+/// plain TCP.
 pub enum Upstream {
     Doh(Arc<DohUpstream>),
     #[cfg(feature = "dot")]
     Dot(Arc<DotUpstream>),
+    #[cfg(feature = "doq")]
+    Doq(Arc<DoqUpstream>),
     PlainUdp(Arc<PlainUdpUpstream>),
     PlainTcp(Arc<PlainTcpUpstream>),
 }
@@ -30,6 +34,8 @@ impl Upstream {
             Upstream::Doh(u) => u.address(),
             #[cfg(feature = "dot")]
             Upstream::Dot(u) => u.address(),
+            #[cfg(feature = "doq")]
+            Upstream::Doq(u) => u.address(),
             Upstream::PlainUdp(u) => u.address(),
             Upstream::PlainTcp(u) => u.address(),
         }
@@ -40,6 +46,8 @@ impl Upstream {
             Upstream::Doh(u) => u.exchange(req).await,
             #[cfg(feature = "dot")]
             Upstream::Dot(u) => u.exchange(req).await,
+            #[cfg(feature = "doq")]
+            Upstream::Doq(u) => u.exchange(req).await,
             Upstream::PlainUdp(u) => u.exchange(req).await,
             Upstream::PlainTcp(u) => u.exchange(req).await,
         }

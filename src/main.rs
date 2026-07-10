@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use doh_upstream::client::bootstrap::{DohResolver, ParallelResolver, PlainResolver, Resolver};
-use doh_upstream::{Cache, CacheOptions, HttpVersion, Options, UpstreamConfig, parse_upstream};
+use doh_upstream::{
+    Cache, CacheOptions, HttpVersion, Options, UpstreamConfig, UpstreamMode, parse_upstream,
+};
 
 #[cfg(all(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
 compile_error!(
@@ -73,6 +75,26 @@ pub fn init_log(verbose: u8, default_level: &str, no_timestamp: bool) {
     }
 }
 
+/// CLI-facing mirror of [`UpstreamMode`], needed because `clap::ValueEnum`
+/// can't be derived on a type from another module without also deriving
+/// `Clone`/`Copy` there in a way that fits clap's expectations.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum UpstreamModeArg {
+    Ordered,
+    RoundRobin,
+    LoadBalance,
+}
+
+impl From<UpstreamModeArg> for UpstreamMode {
+    fn from(mode: UpstreamModeArg) -> Self {
+        match mode {
+            UpstreamModeArg::Ordered => UpstreamMode::Ordered,
+            UpstreamModeArg::RoundRobin => UpstreamMode::RoundRobin,
+            UpstreamModeArg::LoadBalance => UpstreamMode::LoadBalance,
+        }
+    }
+}
+
 /// A minimal standalone DNS-over-HTTPS forwarding proxy.
 #[derive(Parser)]
 #[command(version)]
@@ -115,6 +137,15 @@ struct Args {
     /// Overall timeout for exchanges, bootstrap lookups, and H3 probes, in seconds.
     #[arg(long, default_value_t = 10)]
     timeout: u64,
+
+    /// How to order the upstreams within a rule before trying them:
+    /// "ordered" always prefers the first-configured upstream, falling back
+    /// to later ones only on failure; "round-robin" rotates the starting
+    /// upstream on each query; "load-balance" prefers whichever upstream has
+    /// answered fastest recently, so traffic drifts toward the quicker
+    /// server over time.
+    #[arg(long, value_enum, default_value_t = UpstreamModeArg::Ordered)]
+    upstream_mode: UpstreamModeArg,
 
     /// Server(s) used to resolve upstream hostnames: a plain DNS address
     /// (e.g. --bootstrap 1.1.1.1, port defaults to 53) or a DoH/DoH3 URL
@@ -541,14 +572,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chain(upstream_arg_text.iter().flat_map(|text| text.lines()))
         .chain(upstream_file_text.iter().flat_map(|text| text.lines()))
         .collect();
-    let upstream_config = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {
-        let joined = errs
-            .iter()
-            .map(|(idx, e)| format!("line {}: {e}", idx + 1))
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!("parsing upstreams: {joined}")
-    })?;
+    let upstream_config =
+        UpstreamConfig::parse_with_mode(&lines, &base_opts, args.upstream_mode.into()).map_err(
+            |errs| {
+                let joined = errs
+                    .iter()
+                    .map(|(idx, e)| format!("line {}: {e}", idx + 1))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("parsing upstreams: {joined}")
+            },
+        )?;
 
     #[cfg(feature = "doh-server")]
     let doh_credentials = {

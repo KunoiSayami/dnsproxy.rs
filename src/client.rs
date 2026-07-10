@@ -27,6 +27,6 @@ pub use doq::DoqUpstream;
 pub use dot::DotUpstream;
 pub use plain_tcp::PlainTcpUpstream;
 pub use plain_udp::PlainUdpUpstream;
-pub use upstream::Upstream;
-pub use upstream_config::UpstreamConfig;
+pub use upstream::{TrackedUpstream, Upstream};
+pub use upstream_config::{UpstreamConfig, UpstreamMode};
 pub use upstream_url::parse_upstream;

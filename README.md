@@ -32,9 +32,12 @@ feature.
   policy
 - Domain-scoped upstream routing (`UpstreamConfig`), parsing an AdGuard
   dnsproxy-style upstream list — including `[/domain1/.../domainN/]upstream1
-  upstream2 ...` rules — with hierarchical suffix matching and in-order
-  fallback across an upstream rule's servers, mixing any of the supported
-  transports
+  upstream2 ...` rules — with hierarchical suffix matching and fallback
+  across an upstream rule's servers, mixing any of the supported transports
+- Selectable upstream ordering (`UpstreamMode`): try upstreams in configured
+  order (default), round-robin the starting upstream per query, or
+  load-balance by preferring whichever upstream has answered fastest
+  recently
 
 ## Standalone binary
 
@@ -63,6 +66,7 @@ Useful flags:
 | `--listen <addr>` | Address to listen on for plain DNS (UDP+TCP). Repeatable. |
 | `--port <port>` | Shorthand for listening on the IPv4 and IPv6 wildcard addresses on this port. |
 | `--upstream-file <path>` | Path to an upstream config file (see above). Upstreams may be DoH URLs (`https://`, or `h3://` for HTTP/3-only, optionally with HTTP Basic Auth as `user:pass@host`), `tls://host[:port]` for DoT (requires the `dot` feature), `quic://host[:port]` for DoQ (requires the `doq` feature), `tcp://host[:port]` for plain DNS-over-TCP, or `udp://host[:port]`/a bare `host[:port]` for plain DNS-over-UDP. |
+| `--upstream-mode <mode>` | How to order the upstreams within a rule before trying them: `ordered` (default) always prefers the first-configured upstream, falling back to later ones only on failure; `round-robin` rotates the starting upstream on each query; `load-balance` prefers whichever upstream has answered fastest recently. |
 | `--timeout <secs>` | Overall timeout for exchanges, bootstrap lookups, and H3 probes (default `10`). |
 | `--bootstrap <addr>` | Server used to resolve upstream hostnames: a plain DNS address, e.g. `1.1.1.1` or `[2606:4700:4700::1111]:53` (port defaults to `53`), or a DoH/DoH3 URL with a literal IP host, e.g. `https://1.1.1.1/dns-query` (`h3://` requires `--http3`). Repeatable; queried in parallel. Defaults to the system resolver. |
 | `--insecure` | Disable TLS certificate verification. |

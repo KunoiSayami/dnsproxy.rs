@@ -21,7 +21,10 @@ pub use client::DohUpstream;
 pub use client::DoqUpstream;
 #[cfg(feature = "dot")]
 pub use client::DotUpstream;
-pub use client::{PlainTcpUpstream, PlainUdpUpstream, Upstream, UpstreamConfig, parse_upstream};
+pub use client::{
+    PlainTcpUpstream, PlainUdpUpstream, TrackedUpstream, Upstream, UpstreamConfig, UpstreamMode,
+    parse_upstream,
+};
 pub use error::DohError;
 #[cfg(feature = "doh-server")]
 pub use listener::Credentials;

@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
@@ -57,6 +57,9 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 http = { version = "1", optional = true }
 
+crypto_box = { version = "0.9", features = ["salsa20"], optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 rcgen = "0.14"
@@ -66,6 +69,7 @@ default = ["http3", "dot", "doq", "crypto-ring"]
 http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:http"]
 dot = ["dep:rustls"]
 doq = ["dep:quinn", "dep:rustls"]
+dnscrypt = ["dep:crypto_box", "dep:ed25519-dalek"]
 
 # Reverse (server-side) listeners: this program acts as the receiver for
 # downstream clients, forwarding what it receives to the configured

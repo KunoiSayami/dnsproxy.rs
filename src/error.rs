@@ -32,6 +32,10 @@ pub enum DohError {
     #[cfg(any(feature = "http3", feature = "doq"))]
     #[error("quic error: {0}")]
     Quic(String),
+
+    #[cfg(feature = "dnscrypt")]
+    #[error("dnscrypt: {0}")]
+    DnsCrypt(String),
 }
 
 impl DohError {

@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use hyper::Uri;
 
+#[cfg(feature = "dnscrypt")]
+use crate::client::dnscrypt::DnsCryptUpstream;
 use crate::client::doh::DohUpstream;
 #[cfg(feature = "doq")]
 use crate::client::doq::DoqUpstream;
@@ -197,6 +199,15 @@ pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, S
                 clone_opts(base_opts),
             ))))
         }
+        #[cfg(feature = "dnscrypt")]
+        "sdns" => Ok(Upstream::DnsCrypt(Arc::new(DnsCryptUpstream::new(
+            addr,
+            clone_opts(base_opts),
+        )?))),
+        #[cfg(not(feature = "dnscrypt"))]
+        "sdns" => Err(format!(
+            "upstream {addr:?} is a DNSCrypt stamp, but this build was compiled without the \"dnscrypt\" feature"
+        )),
         _ => Ok(Upstream::Doh(parse_upstream(addr, base_opts)?)),
     }
 }

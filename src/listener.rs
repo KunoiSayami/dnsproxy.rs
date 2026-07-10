@@ -1,6 +1,8 @@
 //! DNS server/listener implementations: accepting incoming queries over
 //! plain DNS-over-UDP/TCP, DoT, DoQ, DoH, and DoH3.
 
+#[cfg(feature = "dnscrypt-server")]
+pub mod dnscrypt;
 #[cfg(feature = "doh-server")]
 pub mod doh;
 #[cfg(feature = "http3-server")]

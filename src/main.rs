@@ -246,6 +246,40 @@ struct Args {
     #[cfg(feature = "doh-server")]
     #[arg(long)]
     doh_auth_file: Option<PathBuf>,
+
+    /// Address to listen on for DNSCrypt (both UDP and TCP). May be
+    /// repeated. Requires --dnscrypt-config.
+    #[cfg(feature = "dnscrypt-server")]
+    #[arg(long, conflicts_with = "dnscrypt_port")]
+    dnscrypt_listen: Vec<SocketAddr>,
+
+    /// Listen on this port for DNSCrypt, on both the IPv4 and IPv6 wildcard
+    /// addresses. Shorthand for --dnscrypt-listen 0.0.0.0:<port>
+    /// --dnscrypt-listen [::]:<port>.
+    #[cfg(feature = "dnscrypt-server")]
+    #[arg(long, conflicts_with = "dnscrypt_listen")]
+    dnscrypt_port: Option<u16>,
+
+    /// Path to a DNSCrypt resolver config file (provider name and signing
+    /// keys), as written by --dnscrypt-generate-config. Required to enable
+    /// --dnscrypt-listen/--dnscrypt-port.
+    #[cfg(feature = "dnscrypt-server")]
+    #[arg(long)]
+    dnscrypt_config: Option<PathBuf>,
+
+    /// Generates a new DNSCrypt resolver config (provider signing key and
+    /// resolver keypair) for --dnscrypt-provider-name, writes it to this
+    /// path, prints the resulting sdns:// stamp for clients to use, and
+    /// exits without starting any listener.
+    #[cfg(feature = "dnscrypt-server")]
+    #[arg(long, requires = "dnscrypt_provider_name")]
+    dnscrypt_generate_config: Option<PathBuf>,
+
+    /// Provider name for --dnscrypt-generate-config, e.g.
+    /// 2.dnscrypt-cert.example.org.
+    #[cfg(feature = "dnscrypt-server")]
+    #[arg(long)]
+    dnscrypt_provider_name: Option<String>,
 }
 
 /// The standard reverse-DNS zones for RFC 1918 private and RFC 6303
@@ -323,7 +357,12 @@ fn parse_bootstrap(s: &str, doh_opts: &Options) -> Result<Arc<dyn Resolver>, Str
 /// expanded to the IPv4 and IPv6 wildcard addresses. Empty (rather than
 /// defaulting to any address) when neither was given, since these listeners
 /// are opt-in unlike the always-on plain DNS listener.
-#[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
+#[cfg(any(
+    feature = "doq-server",
+    feature = "dot-server",
+    feature = "doh-server",
+    feature = "dnscrypt-server"
+))]
 fn expand_listen(listen: &[SocketAddr], port: Option<u16>) -> Vec<SocketAddr> {
     if let Some(port) = port {
         return vec![
@@ -358,10 +397,15 @@ impl Args {
         vec![SocketAddr::from(([127, 0, 0, 1], 53))]
     }
 
-    /// Whether any of the secure listeners (DoQ, DoT, DoH/DoH3) were
-    /// requested via `--*-listen` or `--*-port`.
+    /// Whether any of the secure listeners (DoQ, DoT, DoH/DoH3, DNSCrypt)
+    /// were requested via `--*-listen` or `--*-port`.
     #[cfg_attr(
-        not(any(feature = "doq-server", feature = "dot-server", feature = "doh-server")),
+        not(any(
+            feature = "doq-server",
+            feature = "dot-server",
+            feature = "doh-server",
+            feature = "dnscrypt-server"
+        )),
         allow(clippy::unused_self)
     )]
     fn secure_listener_enabled(&self) -> bool {
@@ -380,13 +424,42 @@ impl Args {
         #[cfg(not(feature = "doh-server"))]
         let https = false;
 
-        quic || tls || https
+        #[cfg(feature = "dnscrypt-server")]
+        let dnscrypt = !self.dnscrypt_listen.is_empty() || self.dnscrypt_port.is_some();
+        #[cfg(not(feature = "dnscrypt-server"))]
+        let dnscrypt = false;
+
+        quic || tls || https || dnscrypt
     }
+}
+
+#[cfg(feature = "dnscrypt-server")]
+fn run_dnscrypt_generate_config(path: &std::path::Path, provider_name: &str) -> Result<(), String> {
+    let config = doh_upstream::client::dnscrypt::keygen::ResolverConfig::generate(provider_name);
+    doh_upstream::client::dnscrypt::config::save(path, &config)?;
+
+    println!("Wrote DNSCrypt resolver config to {}", path.display());
+    println!(
+        "Stamp (replace the host:port with your public address before distributing to clients):"
+    );
+    println!("{}", config.stamp("0.0.0.0:443".parse().unwrap()));
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    #[cfg(feature = "dnscrypt-server")]
+    if let Some(path) = &args.dnscrypt_generate_config {
+        let provider_name = args
+            .dnscrypt_provider_name
+            .as_ref()
+            .ok_or("--dnscrypt-provider-name is required with --dnscrypt-generate-config")?;
+        run_dnscrypt_generate_config(path, provider_name)?;
+        return Ok(());
+    }
+
     init_log(args.verbose, &args.log_level, args.no_timestamp);
 
     tracing::info!(
@@ -626,6 +699,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await?;
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "dnscrypt-server")]
+    {
+        let dnscrypt_addrs = expand_listen(&args.dnscrypt_listen, args.dnscrypt_port);
+        if !dnscrypt_addrs.is_empty() {
+            let config_path = args.dnscrypt_config.as_ref().ok_or(
+                "--dnscrypt-config is required to enable --dnscrypt-listen/--dnscrypt-port",
+            )?;
+            let resolver_config = doh_upstream::client::dnscrypt::config::load(config_path)?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            let cert_ttl = doh_upstream::client::dnscrypt::keygen::DEFAULT_CERT_TTL_SECS;
+            let server_config = doh_upstream::listener::dnscrypt::DnsCryptServerConfig::new(
+                resolver_config.resolver_secret_key,
+                &resolver_config.provider_signing_key,
+                resolver_config.provider_name,
+                *b"DNSC\0\0\0\0",
+                1,
+                now,
+                now.saturating_add(cert_ttl),
+            );
+
+            tracing::info!(listen = ?dnscrypt_addrs, "dnscrypt listening");
+            doh_upstream::listener::dnscrypt::serve_all(
+                &dnscrypt_addrs,
+                &dnscrypt_addrs,
+                Arc::new(server_config),
+                handler.clone(),
+            )
+            .await?;
         }
     }
 

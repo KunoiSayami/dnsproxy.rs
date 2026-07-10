@@ -14,6 +14,8 @@ pub mod listener;
 pub mod options;
 
 pub use cache::{Cache, CacheOptions};
+#[cfg(feature = "dnscrypt")]
+pub use client::DnsCryptUpstream;
 pub use client::DohUpstream;
 #[cfg(feature = "doq")]
 pub use client::DoqUpstream;

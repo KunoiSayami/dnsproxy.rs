@@ -86,7 +86,7 @@ pub(crate) fn new_socket(
     Ok(socket)
 }
 
-fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     let socket = new_socket(addr, Type::DGRAM, Protocol::UDP)?;
     UdpSocket::from_std(socket.into())
 }

@@ -4,8 +4,12 @@
 //! DNSCrypt v2 wire protocol (`dnscrypt::crypto`) over UDP, falling back to
 //! TCP when the UDP response is truncated.
 
-mod crypto;
-mod stamp;
+#[cfg(feature = "dnscrypt-server")]
+pub mod config;
+pub(crate) mod crypto;
+#[cfg(feature = "dnscrypt-server")]
+pub mod keygen;
+pub(crate) mod stamp;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

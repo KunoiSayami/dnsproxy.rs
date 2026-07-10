@@ -9,15 +9,15 @@
 use crypto_box::aead::rand_core::{OsRng, RngCore};
 use crypto_box::aead::{Aead, generic_array::GenericArray};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::error::DohError;
 
 /// `DNSC`, the fixed magic prefixing every resolver certificate.
-const CERT_MAGIC: &[u8; 4] = b"DNSC";
+pub(crate) const CERT_MAGIC: &[u8; 4] = b"DNSC";
 
 /// es-version for the `X25519-XSalsa20Poly1305` cipher suite.
-const ES_VERSION_XSALSA20POLY1305: u16 = 0x0001;
+pub(crate) const ES_VERSION_XSALSA20POLY1305: u16 = 0x0001;
 
 /// The fixed 8-byte magic prefixing every resolver response.
 const RESOLVER_MAGIC: &[u8; 8] = b"r6fnvWj8";
@@ -116,6 +116,38 @@ fn parse_one_certificate(bytes: &[u8], verifying_key: &VerifyingKey) -> Option<C
     })
 }
 
+/// Builds and signs a resolver certificate's raw bytes, the mirror image of
+/// [`parse_one_certificate`]: `provider_signing_key` signs over
+/// `resolver_public_key || client_magic || serial || ts_start || ts_end`,
+/// and the result is prefixed with the magic/es-version/minor-version
+/// header. Always uses the `X25519-XSalsa20Poly1305` cipher suite, matching
+/// this crate's only supported suite.
+pub fn sign_certificate(
+    provider_signing_key: &SigningKey,
+    resolver_public_key: &[u8; 32],
+    client_magic: &[u8; 8],
+    serial: u32,
+    ts_start: u32,
+    ts_end: u32,
+) -> Vec<u8> {
+    let mut signed = Vec::new();
+    signed.extend_from_slice(resolver_public_key);
+    signed.extend_from_slice(client_magic);
+    signed.extend_from_slice(&serial.to_be_bytes());
+    signed.extend_from_slice(&ts_start.to_be_bytes());
+    signed.extend_from_slice(&ts_end.to_be_bytes());
+
+    let signature = provider_signing_key.sign(&signed);
+
+    let mut cert = Vec::with_capacity(8 + 64 + signed.len());
+    cert.extend_from_slice(CERT_MAGIC);
+    cert.extend_from_slice(&ES_VERSION_XSALSA20POLY1305.to_be_bytes());
+    cert.extend_from_slice(&[0x00, 0x00]); // minor version
+    cert.extend_from_slice(&signature.to_bytes());
+    cert.extend_from_slice(&signed);
+    cert
+}
+
 /// An ephemeral client keypair, generated fresh per exchange per the spec
 /// (unlike the resolver's short-term key, which is reused until its
 /// certificate expires).
@@ -169,10 +201,13 @@ fn unpad(padded: &[u8]) -> Result<&[u8], DohError> {
     }
 }
 
-/// Builds the `SalsaBox` shared between a client keypair and a resolver's
-/// certified public key.
-fn shared_box(client_secret: &SecretKey, resolver_public_key: &[u8; 32]) -> SalsaBox {
-    SalsaBox::new(&PublicKey::from(*resolver_public_key), client_secret)
+/// Builds the `SalsaBox` shared between one side's secret key and the other
+/// side's public key. Symmetric: the same box results whether called as
+/// `shared_box(client_secret, resolver_pk)` or
+/// `shared_box(resolver_secret, client_pk)`, since both derive the same
+/// X25519 Diffie-Hellman shared secret.
+fn shared_box(secret_key: &SecretKey, peer_public_key: &[u8; 32]) -> SalsaBox {
+    SalsaBox::new(&PublicKey::from(*peer_public_key), secret_key)
 }
 
 /// Encrypts `msg` (a raw DNS wireformat query) for `cert`, returning the
@@ -243,6 +278,71 @@ pub fn decrypt_response(
         .map_err(|e| DohError::DnsCrypt(format!("decrypting response: {e}")))?;
 
     Ok(unpad(&padded)?.to_vec())
+}
+
+/// Parses the `<client-magic><client-pk><client-nonce><ciphertext>` framing
+/// of an incoming encrypted query and decrypts it with the resolver's secret
+/// key, the mirror image of [`encrypt_query`]. Returns the decrypted,
+/// unpadded query bytes along with the client's public key and nonce half
+/// (both needed to encrypt the matching response via
+/// [`encrypt_server_response`]).
+pub fn decrypt_query(
+    resolver_secret: &SecretKey,
+    expected_client_magic: &[u8; 8],
+    framed: &[u8],
+) -> Result<(Vec<u8>, [u8; 32], [u8; 12]), DohError> {
+    const HEADER_LEN: usize = 8 + 32 + 12;
+    if framed.len() < HEADER_LEN {
+        return Err(DohError::DnsCrypt("query too short".into()));
+    }
+    if &framed[0..8] != expected_client_magic {
+        return Err(DohError::DnsCrypt("query has wrong client magic".into()));
+    }
+
+    let client_public_key: [u8; 32] = framed[8..40].try_into().unwrap();
+    let client_nonce: [u8; 12] = framed[40..52].try_into().unwrap();
+
+    let mut full_nonce = [0u8; 24];
+    full_nonce[..12].copy_from_slice(&client_nonce);
+
+    let salsa_box = shared_box(resolver_secret, &client_public_key);
+    let padded = salsa_box
+        .decrypt(GenericArray::from_slice(&full_nonce), &framed[HEADER_LEN..])
+        .map_err(|e| DohError::DnsCrypt(format!("decrypting query: {e}")))?;
+
+    Ok((unpad(&padded)?.to_vec(), client_public_key, client_nonce))
+}
+
+/// Encrypts `msg` (a raw DNS wireformat response) for the client identified
+/// by `client_public_key`/`client_nonce` (as returned by [`decrypt_query`]),
+/// framing it as `<resolver-magic><client-nonce><resolver-nonce><ciphertext>`,
+/// the mirror image of [`decrypt_response`].
+pub fn encrypt_server_response(
+    resolver_secret: &SecretKey,
+    client_public_key: &[u8; 32],
+    client_nonce: &[u8; 12],
+    msg: &[u8],
+) -> Result<Vec<u8>, DohError> {
+    let mut resolver_nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut resolver_nonce);
+
+    let mut full_nonce = [0u8; 24];
+    full_nonce[..12].copy_from_slice(client_nonce);
+    full_nonce[12..].copy_from_slice(&resolver_nonce);
+
+    let salsa_box = shared_box(resolver_secret, client_public_key);
+    let padded = pad(msg);
+    let ciphertext = salsa_box
+        .encrypt(GenericArray::from_slice(&full_nonce), padded.as_slice())
+        .map_err(|e| DohError::DnsCrypt(format!("encrypting response: {e}")))?;
+
+    let mut framed = Vec::with_capacity(8 + 12 + 12 + ciphertext.len());
+    framed.extend_from_slice(RESOLVER_MAGIC);
+    framed.extend_from_slice(client_nonce);
+    framed.extend_from_slice(&resolver_nonce);
+    framed.extend_from_slice(&ciphertext);
+
+    Ok(framed)
 }
 
 #[cfg(test)]

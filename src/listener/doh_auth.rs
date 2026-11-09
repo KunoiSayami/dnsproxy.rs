@@ -56,6 +56,11 @@ impl Credentials {
 
     /// Parses one `user:password` pair, as given on the `--doh-auth` flag or
     /// one line of `--doh-auth-file`.
+    ///
+    /// A pair wrapped in matching quotes (`'alice:secret'`) is accepted as
+    /// is, quotes included, but logs a warning: it's usually a value copied
+    /// from a shell command or systemd unit, where the quotes were syntax.
+    /// They aren't stripped, since a password may really end in a quote.
     pub fn parse_pair(s: &str) -> Result<(String, String), String> {
         let (user, pass) = s
             .split_once(':')
@@ -63,8 +68,23 @@ impl Credentials {
         if user.is_empty() {
             return Err(format!("invalid credential {s:?}: username is empty"));
         }
+        if is_quoted(s) {
+            // Never the password, and only the first character of the user.
+            let initial = user.chars().nth(1).unwrap_or_default();
+            tracing::warn!(
+                "credential for user {initial}… is wrapped in quotes; the quotes are part of \
+                 the username and password"
+            );
+        }
         Ok((user.to_owned(), pass.to_owned()))
     }
+}
+
+/// Whether `s` starts and ends with the same quote character, `'` or `"`.
+fn is_quoted(s: &str) -> bool {
+    ['\'', '"']
+        .into_iter()
+        .any(|q| s.len() >= 2 && s.starts_with(q) && s.ends_with(q))
 }
 
 /// Splits a Basic Auth header into user and password, mirroring Go's
@@ -194,6 +214,25 @@ mod tests {
         let (user, pass) = Credentials::parse_pair("alice:pass:with:colons").unwrap();
         assert_eq!(user, "alice");
         assert_eq!(pass, "pass:with:colons");
+    }
+
+    #[test]
+    fn parse_pair_keeps_quotes_but_flags_them() {
+        let (user, pass) = Credentials::parse_pair("'alice:secret'").unwrap();
+        assert_eq!(user, "'alice");
+        assert_eq!(pass, "secret'");
+        assert!(is_quoted("'alice:secret'"));
+        assert!(is_quoted("\"alice:secret\""));
+
+        for unquoted in [
+            "alice:secret",
+            "alice:secret'",
+            "'alice:secret\"",
+            "alice:'secret'",
+            "'",
+        ] {
+            assert!(!is_quoted(unquoted), "{unquoted}");
+        }
     }
 
     #[test]

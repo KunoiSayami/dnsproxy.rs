@@ -68,12 +68,24 @@ pub fn init_log(verbose: u8, default_level: &str, no_timestamp: bool) {
         filter = filter.add_directive("reqwest::connect=warn".parse().unwrap());
     }
 
-    let builder = fmt().with_env_filter(filter);
+    let builder = fmt().with_env_filter(filter).with_ansi(use_ansi_colours());
     if no_timestamp || std::env::var_os("JOURNAL_STREAM").is_some() {
         builder.without_time().init();
     } else {
         builder.init();
     }
+}
+
+/// Whether log lines get ANSI colours: only when they go to a terminal (the
+/// fmt subscriber writes to stdout), so the journal and log files don't
+/// fill with escape codes, and never with `NO_COLOR` set, which
+/// tracing-subscriber's own default honours but an explicit `with_ansi`
+/// would override.
+fn use_ansi_colours() -> bool {
+    use std::io::IsTerminal;
+
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    !no_color && std::io::stdout().is_terminal()
 }
 
 /// CLI-facing mirror of [`UpstreamMode`], needed because `clap::ValueEnum`

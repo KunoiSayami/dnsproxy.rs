@@ -9,6 +9,8 @@ pub mod doh;
 pub mod doh3;
 #[cfg(feature = "doh-server")]
 pub mod doh_auth;
+#[cfg(feature = "doh-server")]
+pub mod doh_routes;
 #[cfg(feature = "doq-server")]
 pub mod doq;
 #[cfg(feature = "dot-server")]
@@ -19,4 +21,6 @@ pub mod tls_config;
 
 #[cfg(feature = "doh-server")]
 pub use doh_auth::Credentials;
+#[cfg(feature = "doh-server")]
+pub use doh_routes::DohRoutes;
 pub use io::{Handler, serve, serve_all, with_servfail};

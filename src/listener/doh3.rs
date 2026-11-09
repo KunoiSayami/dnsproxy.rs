@@ -14,6 +14,7 @@ use crate::client::wire::{decode_request, encode_response};
 use crate::error::DohError;
 use crate::listener::doh::find_dns_param;
 use crate::listener::doh_auth::Credentials;
+use crate::listener::doh_routes::DohRoutes;
 use crate::listener::io::{Handler, bind_quic_server};
 
 const MAX_MSG_SIZE: usize = 65535;
@@ -22,12 +23,14 @@ const MAX_MSG_SIZE: usize = 65535;
 /// decoded query to `handler`. Returns once every endpoint is bound; the
 /// accept loops keep running in spawned tasks. `credentials`, if non-empty,
 /// requires every request to present one of its configured `user:password`
-/// pairs via HTTP Basic Auth.
+/// pairs via HTTP Basic Auth. `routes`, if non-empty, limits the URL paths
+/// served; any other path gets a 404.
 pub async fn serve_all(
     addrs: &[SocketAddr],
     tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     handler: Handler,
     credentials: Arc<Credentials>,
+    routes: Arc<DohRoutes>,
 ) -> Result<(), DohError> {
     for &addr in addrs {
         serve(
@@ -35,6 +38,7 @@ pub async fn serve_all(
             Arc::clone(&tls_config),
             Arc::clone(&handler),
             Arc::clone(&credentials),
+            Arc::clone(&routes),
         )
         .await?;
     }
@@ -48,6 +52,7 @@ pub async fn serve(
     tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     handler: Handler,
     credentials: Arc<Credentials>,
+    routes: Arc<DohRoutes>,
 ) -> Result<SocketAddr, DohError> {
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_config).clone())
         .map_err(|e| DohError::Quic(e.to_string()))?;
@@ -60,29 +65,40 @@ pub async fn serve(
     tracing::info!(addr = %bound_addr, "listening for doh3 queries");
 
     tokio::spawn(async move {
-        accept_loop(endpoint, handler, credentials).await;
+        accept_loop(endpoint, handler, credentials, routes).await;
     });
 
     Ok(bound_addr)
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, handler: Handler, credentials: Arc<Credentials>) {
+async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    handler: Handler,
+    credentials: Arc<Credentials>,
+    routes: Arc<DohRoutes>,
+) {
     loop {
         let Some(incoming) = endpoint.accept().await else {
             return;
         };
         let handler = Arc::clone(&handler);
         let credentials = Arc::clone(&credentials);
+        let routes = Arc::clone(&routes);
         tokio::spawn(async move {
             match incoming.await {
-                Ok(conn) => connection_loop(conn, handler, credentials).await,
+                Ok(conn) => connection_loop(conn, handler, credentials, routes).await,
                 Err(e) => tracing::warn!(error = %e, "doh3 handshake failed"),
             }
         });
     }
 }
 
-async fn connection_loop(conn: quinn::Connection, handler: Handler, credentials: Arc<Credentials>) {
+async fn connection_loop(
+    conn: quinn::Connection,
+    handler: Handler,
+    credentials: Arc<Credentials>,
+    routes: Arc<DohRoutes>,
+) {
     let quinn_conn = h3_quinn::Connection::new(conn);
     let mut h3_conn = match h3::server::Connection::new(quinn_conn).await {
         Ok(c) => c,
@@ -103,6 +119,7 @@ async fn connection_loop(conn: quinn::Connection, handler: Handler, credentials:
         };
         let handler = Arc::clone(&handler);
         let credentials = Arc::clone(&credentials);
+        let routes = Arc::clone(&routes);
         tokio::spawn(async move {
             let (req, stream) = match resolver.resolve_request().await {
                 Ok(v) => v,
@@ -111,7 +128,7 @@ async fn connection_loop(conn: quinn::Connection, handler: Handler, credentials:
                     return;
                 }
             };
-            if let Err(e) = handle_request(req, stream, handler, credentials).await {
+            if let Err(e) = handle_request(req, stream, handler, credentials, routes).await {
                 tracing::warn!(error = %e, "doh3 request failed");
             }
         });
@@ -123,7 +140,13 @@ async fn handle_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     handler: Handler,
     credentials: Arc<Credentials>,
+    routes: Arc<DohRoutes>,
 ) -> Result<(), DohError> {
+    // Before auth, as Go's ServeMux does; see the DoH listener.
+    if !routes.allows(req.uri().path()) {
+        return send_response(&mut stream, StatusCode::NOT_FOUND, Bytes::new()).await;
+    }
+
     if !credentials.is_empty() {
         let authorized = req
             .headers()
@@ -171,14 +194,19 @@ async fn handle_request(
     send_response(&mut stream, StatusCode::OK, Bytes::from(bytes)).await
 }
 
+/// Sends `status` with `body`. Only a non-empty body (a DNS message) gets
+/// the `application/dns-message` content type; bare error statuses carry no
+/// headers that would reveal a DoH endpoint, matching the DoH listener.
 async fn send_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
     body: Bytes,
 ) -> Result<(), DohError> {
-    let response = Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/dns-message")
+    let mut builder = Response::builder().status(status);
+    if !body.is_empty() {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/dns-message");
+    }
+    let response = builder
         .body(())
         .map_err(|e| DohError::Http(format!("building response: {e}")))?;
 
@@ -266,6 +294,37 @@ mod tests {
         Arc::new(Credentials::new([]))
     }
 
+    fn any_path() -> Arc<DohRoutes> {
+        Arc::new(DohRoutes::default())
+    }
+
+    fn secret_path() -> Arc<DohRoutes> {
+        Arc::new(DohRoutes::new(["/s3cr3t/dns-query".to_owned()]))
+    }
+
+    /// A DoH client for `path` on the listener at `addr`.
+    fn client_for(
+        addr: SocketAddr,
+        path: &str,
+        basic_auth: Option<(String, String)>,
+    ) -> DohUpstream {
+        DohUpstream::new(
+            "localhost",
+            Some(addr.port()),
+            path,
+            crate::options::Options {
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
+                http_versions: vec![HttpVersion::Http3],
+                timeout: Some(Duration::from_secs(5)),
+                insecure_skip_verify: true,
+                basic_auth,
+                ..Default::default()
+            },
+        )
+    }
+
     #[tokio::test]
     async fn roundtrips_through_doh_upstream_client_over_http3() {
         let addr = serve(
@@ -273,6 +332,7 @@ mod tests {
             Arc::new(server_tls_config()),
             echo_handler(),
             no_credentials(),
+            any_path(),
         )
         .await
         .unwrap();
@@ -310,6 +370,7 @@ mod tests {
                 "alice".to_owned(),
                 "secret".to_owned(),
             )])),
+            any_path(),
         )
         .await
         .unwrap();
@@ -347,6 +408,7 @@ mod tests {
             Arc::new(server_tls_config()),
             crate::listener::io::with_servfail(failing),
             no_credentials(),
+            any_path(),
         )
         .await
         .unwrap();
@@ -387,12 +449,94 @@ mod tests {
             Arc::clone(&tls_config),
             echo_handler(),
             no_credentials(),
+            any_path(),
         )
         .await
         .unwrap();
         let v6_addr = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), v4.port());
-        serve(v6_addr, tls_config, echo_handler(), no_credentials())
+        serve(
+            v6_addr,
+            tls_config,
+            echo_handler(),
+            no_credentials(),
+            any_path(),
+        )
+        .await
+        .expect("[::] bind must not collide with 0.0.0.0 on the same port");
+    }
+
+    #[tokio::test]
+    async fn serves_only_the_configured_paths() {
+        let addr = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(server_tls_config()),
+            echo_handler(),
+            no_credentials(),
+            secret_path(),
+        )
+        .await
+        .unwrap();
+
+        let req = make_query(42, "example.com.");
+        let resp = client_for(addr, "/s3cr3t/dns-query", None)
+            .exchange(&req)
             .await
-            .expect("[::] bind must not collide with 0.0.0.0 on the same port");
+            .unwrap();
+        assert_eq!(resp.metadata.id, 42);
+
+        for path in [
+            "/dns-query",
+            "/",
+            "/s3cr3t/dns-query/x",
+            "/s3cr3t/dns-query/",
+        ] {
+            let result = client_for(addr, path, None).exchange(&req).await;
+            assert!(
+                matches!(result, Err(DohError::UnexpectedStatus { status: 404, .. })),
+                "{path:?}: {:?}",
+                result.map(|_| ())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_the_path_before_credentials() {
+        let addr = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(server_tls_config()),
+            echo_handler(),
+            Arc::new(Credentials::new([(
+                "alice".to_owned(),
+                "secret".to_owned(),
+            )])),
+            secret_path(),
+        )
+        .await
+        .unwrap();
+        let req = make_query(42, "example.com.");
+
+        // Wrong path: 404, not 401, so the endpoint isn't revealed.
+        let result = client_for(addr, "/dns-query", None).exchange(&req).await;
+        assert!(matches!(
+            result,
+            Err(DohError::UnexpectedStatus { status: 404, .. })
+        ));
+
+        // Right path, no credentials: 401.
+        let result = client_for(addr, "/s3cr3t/dns-query", None)
+            .exchange(&req)
+            .await;
+        assert!(matches!(
+            result,
+            Err(DohError::UnexpectedStatus { status: 401, .. })
+        ));
+
+        // Right path and credentials: answered.
+        let auth = Some(("alice".to_owned(), "secret".to_owned()));
+        let resp = client_for(addr, "/s3cr3t/dns-query", auth)
+            .exchange(&req)
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.id, 42);
     }
 }

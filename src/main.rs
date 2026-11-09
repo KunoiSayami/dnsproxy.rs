@@ -259,14 +259,20 @@ struct Args {
 
     /// TLS certificate chain (PEM), for any of --quic-listen/--quic-port,
     /// --tls-listen/--tls-port, or --https-listen/--https-port. Shared by
-    /// all enabled listeners.
+    /// all enabled listeners. Also accepted as --listener-tls-cert, its
+    /// former name.
     #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
-    #[arg(long, requires = "listener_tls_key")]
+    #[arg(
+        long = "tls-cert",
+        alias = "listener-tls-cert",
+        value_name = "FILE",
+        requires = "listener_tls_key"
+    )]
     listener_tls_cert: Option<PathBuf>,
 
-    /// TLS private key (PEM), paired with --listener-tls-cert.
+    /// TLS private key (PEM), paired with --tls-cert.
     #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
-    #[arg(long = "tls-key", requires = "listener_tls_cert")]
+    #[arg(long = "tls-key", value_name = "FILE", requires = "listener_tls_cert")]
     listener_tls_key: Option<PathBuf>,
 
     /// Require HTTP Basic Auth on the DoH/DoH3 listeners, in `user:password`
@@ -284,6 +290,22 @@ struct Args {
     #[cfg(feature = "doh-server")]
     #[arg(long)]
     doh_auth_file: Option<PathBuf>,
+
+    /// Serve DoH/DoH3 only on this exact URL path (e.g. a secret
+    /// /<random>/dns-query); every other path gets a bare 404, checked
+    /// before --doh-auth. May be repeated. Combined with the paths from
+    /// --doh-path-file, if given. If neither is given, any path is served,
+    /// as Go dnsproxy does without doh-routes. Prefer --doh-path-file for a
+    /// secret path: flag values are visible to every local user via ps.
+    #[cfg(feature = "doh-server")]
+    #[arg(long = "doh-path")]
+    doh_paths: Vec<String>,
+
+    /// Path to a file of DoH/DoH3 URL paths to serve, one per line; see
+    /// --doh-path. Blank lines and lines starting with # are ignored.
+    #[cfg(feature = "doh-server")]
+    #[arg(long)]
+    doh_path_file: Option<PathBuf>,
 
     /// Address to listen on for DNSCrypt (both UDP and TCP). May be
     /// repeated. Requires --dnscrypt-config.
@@ -618,6 +640,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(doh_upstream::Credentials::new(pairs))
     };
 
+    #[cfg(feature = "doh-server")]
+    let doh_routes = {
+        let doh_path_file_text = args
+            .doh_path_file
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("reading {}: {e}", path.display()))
+            })
+            .transpose()?;
+        let paths = args
+            .doh_paths
+            .iter()
+            .map(String::as_str)
+            .chain(
+                doh_path_file_text
+                    .iter()
+                    .flat_map(|text| text.lines())
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#')),
+            )
+            .map(doh_upstream::DohRoutes::parse_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.doh_path_file.is_some() && paths.is_empty() {
+            // An empty file would otherwise silently serve every path.
+            return Err("--doh-path-file contains no paths".into());
+        }
+        Arc::new(doh_upstream::DohRoutes::new(paths))
+    };
+
     let listen_addrs = args.listen_addrs();
     tracing::info!(listen = ?listen_addrs, upstream_file = ?args.upstream_file, "forwarding");
 
@@ -723,12 +775,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tls_config =
                     doh_upstream::listener::tls_config::load_server_tls_config(cert, key, alpn)?;
                 let tls_config = Arc::new(tls_config);
-                tracing::info!(listen = ?https_addrs, "doh listening");
+                // Log how many paths, never the paths: they're usually secret.
+                tracing::info!(
+                    listen = ?https_addrs,
+                    paths = doh_routes.len(),
+                    "doh listening"
+                );
                 doh_upstream::listener::doh::serve_all(
                     &https_addrs,
                     Arc::clone(&tls_config),
                     handler.clone(),
                     Arc::clone(&doh_credentials),
+                    Arc::clone(&doh_routes),
                 )
                 .await?;
 
@@ -740,6 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tls_config,
                         handler.clone(),
                         Arc::clone(&doh_credentials),
+                        Arc::clone(&doh_routes),
                     )
                     .await?;
                 }

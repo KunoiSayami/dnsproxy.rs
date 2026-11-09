@@ -161,6 +161,10 @@ pub struct UpstreamConfig {
 
     /// How each group's upstreams are ordered before being tried.
     mode: UpstreamMode,
+
+    /// Upstreams to try, all at once, when every upstream for a query has
+    /// failed; see [`Self::with_fallback`].
+    fallback: Option<Box<UpstreamConfig>>,
 }
 
 impl UpstreamConfig {
@@ -240,7 +244,21 @@ impl UpstreamConfig {
             domain_upstreams,
             default_upstreams,
             mode,
+            fallback: None,
         })
+    }
+
+    /// Sets the fallback upstreams, mirroring Go's `Config.Fallbacks`: when
+    /// every upstream for a query has failed, the query is sent to all of
+    /// `fallback`'s upstreams for that name at once (Go's
+    /// `upstream.ExchangeParallel`), whatever `fallback`'s own mode, and the
+    /// first answer is used. Not used when no upstream matched the name in
+    /// the first place. `fallback`'s own fallback, if any, is ignored.
+    pub fn with_fallback(mut self, mut fallback: UpstreamConfig) -> Self {
+        fallback.mode = UpstreamMode::Parallel;
+        fallback.fallback = None;
+        self.fallback = Some(Box::new(fallback));
+        self
     }
 
     /// Returns the upstreams that should handle a query for `fqdn`,
@@ -296,6 +314,28 @@ impl UpstreamConfig {
             )));
         }
 
+        let err = match self.exchange_with(upstreams, req).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
+        };
+        let Some(fallback) = &self.fallback else {
+            return Err(err);
+        };
+        let fallback_upstreams = fallback.upstreams_for(&name);
+        if fallback_upstreams.is_empty() {
+            return Err(err);
+        }
+        tracing::debug!(error = %err, "upstreams failed; using fallback");
+        fallback.exchange_with(fallback_upstreams, req).await
+    }
+
+    /// Exchanges `req` with `upstreams` (non-empty, as ordered by
+    /// [`Self::upstreams_for`]) per this config's mode.
+    async fn exchange_with(
+        &self,
+        upstreams: Vec<Arc<TrackedUpstream>>,
+        req: &Message,
+    ) -> Result<Message, DohError> {
         match self.mode {
             UpstreamMode::Ordered | UpstreamMode::RoundRobin => {
                 let mut last_err = None;
@@ -930,5 +970,89 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let total = a_hits.load(Ordering::SeqCst) + b_hits.load(Ordering::SeqCst);
         assert_eq!(total, 1);
+    }
+
+    fn udp_line(domains: &str, addrs: &[std::net::SocketAddr]) -> String {
+        let upstreams: Vec<String> = addrs.iter().map(|a| format!("udp://{a}")).collect();
+        format!("{domains}{}", upstreams.join(" "))
+    }
+
+    fn udp_opts() -> Options {
+        Options {
+            timeout: Some(Duration::from_millis(500)),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_answers_when_every_upstream_fails() {
+        let refused = closed_udp_port();
+        let (fb_a, a_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let (fb_b, b_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let fallback = UpstreamConfig::parse(
+            &[udp_line("[/example.com/]", &[fb_a, fb_b]).as_str()],
+            &udp_opts(),
+        )
+        .unwrap();
+        let cfg = UpstreamConfig::parse(
+            &[udp_line("[/example.com/]", &[refused]).as_str()],
+            &udp_opts(),
+        )
+        .unwrap()
+        .with_fallback(fallback);
+
+        let resp = cfg.exchange(&query()).await.unwrap();
+        assert_eq!(resp.metadata.id, 7);
+        // Queried in parallel, like Go's ExchangeParallel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_is_not_used_while_an_upstream_answers() {
+        let refused = closed_udp_port();
+        let (answering, _) = udp_server(Some(Duration::from_millis(5))).await;
+        let (fb, fb_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let fallback = UpstreamConfig::parse(&[udp_line("", &[fb]).as_str()], &udp_opts()).unwrap();
+        let cfg = UpstreamConfig::parse(
+            &[udp_line("[/example.com/]", &[refused, answering]).as_str()],
+            &udp_opts(),
+        )
+        .unwrap()
+        .with_fallback(fallback);
+
+        cfg.exchange(&query()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fb_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_is_not_used_when_no_upstream_matches() {
+        let (other, _) = udp_server(Some(Duration::from_millis(5))).await;
+        let (fb, fb_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let fallback = UpstreamConfig::parse(&[udp_line("", &[fb]).as_str()], &udp_opts()).unwrap();
+        // Only a rule for another domain, and no default upstream.
+        let cfg =
+            UpstreamConfig::parse(&[udp_line("[/other.org/]", &[other]).as_str()], &udp_opts())
+                .unwrap()
+                .with_fallback(fallback);
+
+        assert!(cfg.exchange(&query()).await.is_err());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fb_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fails_when_upstreams_and_fallback_all_fail() {
+        let fallback =
+            UpstreamConfig::parse(&[udp_line("", &[closed_udp_port()]).as_str()], &udp_opts())
+                .unwrap();
+        let cfg =
+            UpstreamConfig::parse(&[udp_line("", &[closed_udp_port()]).as_str()], &udp_opts())
+                .unwrap()
+                .with_fallback(fallback);
+
+        assert!(cfg.exchange(&query()).await.is_err());
     }
 }

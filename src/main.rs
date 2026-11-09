@@ -137,6 +137,14 @@ struct Args {
     #[arg(long)]
     upstream_file: Option<PathBuf>,
 
+    /// Fallback upstream rule, tried only when every upstream for a query
+    /// has failed: all fallback upstreams for the name are queried at once
+    /// and the first answer is used, whatever --upstream-mode is. Same
+    /// syntax as --upstream, including reading the value as a config file
+    /// if it names one. May be repeated. Mirrors Go dnsproxy's --fallback.
+    #[arg(short = 'f', long = "fallback")]
+    fallbacks: Vec<String>,
+
     /// Overall timeout for exchanges, bootstrap lookups, and H3 probes, in seconds.
     #[arg(long, default_value_t = 10)]
     timeout: u64,
@@ -377,6 +385,23 @@ const PRIVATE_REVERSE_ZONES: &[&str] = &[
     "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
 ];
 
+/// Reads `--upstream`/`--fallback` values: each one that names an existing
+/// file is replaced by the file's contents (a config file of rules), and
+/// any other value is kept as a single rule.
+fn read_rule_sources(sources: &[String]) -> Result<Vec<String>, String> {
+    sources
+        .iter()
+        .map(|s| {
+            let path = std::path::Path::new(s);
+            if path.is_file() {
+                std::fs::read_to_string(path).map_err(|e| format!("reading {s}: {e}"))
+            } else {
+                Ok(s.clone())
+            }
+        })
+        .collect()
+}
+
 /// Builds a single `[/zone1/.../zoneN/]upstream` config line routing every
 /// private-use reverse-DNS zone to `upstream`.
 fn private_upstream_line(upstream: &str) -> String {
@@ -526,6 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         upstream = ?args.upstreams.iter().map(|u| redact_rule(u)).collect::<Vec<_>>(),
         upstream_file = ?args.upstream_file,
+        fallback = ?args.fallbacks.iter().map(|f| redact_rule(f)).collect::<Vec<_>>(),
         bootstrap = ?args.bootstrap.iter().map(|b| redact_url(b)).collect::<Vec<_>>(),
         private_upstream = ?args.private_upstream.as_deref().map(redact_url),
         insecure = args.insecure,
@@ -583,18 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))
         })
         .transpose()?;
-    let upstream_arg_text = args
-        .upstreams
-        .iter()
-        .map(|s| {
-            let path = std::path::Path::new(s);
-            if path.is_file() {
-                std::fs::read_to_string(path).map_err(|e| format!("reading {s}: {e}"))
-            } else {
-                Ok(s.clone())
-            }
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let upstream_arg_text = read_rule_sources(&args.upstreams)?;
     let private_upstream_line = args.private_upstream.as_deref().map(private_upstream_line);
     let lines: Vec<&str> = private_upstream_line
         .iter()
@@ -613,6 +628,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("parsing upstreams: {joined}")
             },
         )?;
+
+    let upstream_config = if args.fallbacks.is_empty() {
+        upstream_config
+    } else {
+        let fallback_text = read_rule_sources(&args.fallbacks)?;
+        // Keep private reverse-DNS queries on the private upstream, as Go
+        // never sends them to fallbacks: a failed one is retried there
+        // instead of leaking to a public resolver.
+        let lines: Vec<&str> = private_upstream_line
+            .iter()
+            .map(String::as_str)
+            .chain(fallback_text.iter().flat_map(|text| text.lines()))
+            .collect();
+        let fallback = UpstreamConfig::parse(&lines, &base_opts).map_err(|errs| {
+            let joined = errs
+                .iter()
+                .map(|(idx, e)| format!("line {}: {e}", idx + 1))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("parsing fallbacks: {joined}")
+        })?;
+        upstream_config.with_fallback(fallback)
+    };
 
     #[cfg(feature = "doh-server")]
     let doh_credentials = {

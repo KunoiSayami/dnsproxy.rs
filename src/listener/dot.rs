@@ -41,7 +41,7 @@ pub async fn serve(
 
     tracing::info!(addr = %bound_addr, "listening for dot queries");
 
-    tokio::spawn(async move {
+    crate::listener::spawn_accept_loop(async move {
         accept_loop(listener, acceptor, handler).await;
     });
 

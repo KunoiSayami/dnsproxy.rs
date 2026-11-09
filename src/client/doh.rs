@@ -136,6 +136,27 @@ impl DohUpstream {
         }
     }
 
+    /// The transport this upstream's exchanges currently use, for stats:
+    /// `"udp"` for HTTP/3 (QUIC), `"tcp"` for HTTP/2 or 1.1. Before the
+    /// first HTTP/3 probe has settled, a mixed-version upstream reports
+    /// `"tcp"`.
+    pub fn transport(&self) -> &'static str {
+        #[cfg(feature = "http3")]
+        if self.http_versions.contains(&HttpVersion::Http3) {
+            if !self.http2_supported() {
+                return "udp";
+            }
+            if self
+                .prefer_h3
+                .try_lock()
+                .is_ok_and(|prefer| *prefer == Some(true))
+            {
+                return "udp";
+            }
+        }
+        "tcp"
+    }
+
     /// Whether HTTP/2 (or 1.1) is among this upstream's allowed versions,
     /// i.e. whether the racing probe against HTTP/3 is meaningful at all.
     #[cfg(feature = "http3")]

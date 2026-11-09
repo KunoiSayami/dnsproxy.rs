@@ -23,6 +23,8 @@ use crate::client::upstream_url::{parse_any_upstream, redact_url};
 use crate::error::DohError;
 use crate::listener::io::Handler;
 use crate::options::Options;
+use crate::stats::label::upstream_label;
+use crate::stats::{Role, RoleCollector, Source, set_source};
 
 /// A separator between labels of a domain name.
 const LABEL_SEP: char = '.';
@@ -212,7 +214,10 @@ impl UpstreamConfig {
                     Some(existing) => Arc::clone(existing),
                     None => match parse_any_upstream(u, base_opts) {
                         Ok(built) => {
-                            let built = Arc::new(TrackedUpstream::new(Arc::new(built)));
+                            let built = Arc::new(TrackedUpstream::with_label(
+                                Arc::new(built),
+                                upstream_label(u),
+                            ));
                             upstream_index.insert(u.clone(), Arc::clone(&built));
                             built
                         }
@@ -246,6 +251,27 @@ impl UpstreamConfig {
             mode,
             fallback: None,
         })
+    }
+
+    /// Every distinct upstream in this config, with how it's used: `default`
+    /// if any plain line uses it, else `domain`, and `fallback` for the
+    /// upstreams of [`Self::with_fallback`]. For [`crate::stats::Stats`].
+    pub fn upstreams_with_roles(&self) -> Vec<(Arc<TrackedUpstream>, Role)> {
+        let mut roles = RoleCollector::default();
+        for upstream in &self.default_upstreams.upstreams {
+            roles.add(upstream, Role::Default);
+        }
+        for group in self.domain_upstreams.values() {
+            for upstream in &group.upstreams {
+                roles.add(upstream, Role::Domain);
+            }
+        }
+        if let Some(fallback) = &self.fallback {
+            for (upstream, _) in fallback.upstreams_with_roles() {
+                roles.add(&upstream, Role::Fallback);
+            }
+        }
+        roles.finish()
     }
 
     /// Sets the fallback upstreams, mirroring Go's `Config.Fallbacks`: when
@@ -341,7 +367,10 @@ impl UpstreamConfig {
                 let mut last_err = None;
                 for upstream in upstreams {
                     match upstream.exchange(req).await {
-                        Ok(resp) => return Ok(resp),
+                        Ok(resp) => {
+                            set_source(Source::Upstream(Arc::clone(upstream.label())));
+                            return Ok(resp);
+                        }
                         Err(e) => last_err = Some(e),
                     }
                 }
@@ -400,7 +429,10 @@ async fn race(
             }
             let delay = hedge_delay(&upstream);
             let req = Arc::clone(&req);
-            running.push(async move { upstream.exchange(&req).await });
+            running.push(async move {
+                let result = upstream.exchange(&req).await;
+                (upstream, result)
+            });
             if delay.is_zero() {
                 start_next = true;
             } else {
@@ -413,8 +445,11 @@ async fn race(
         }
 
         tokio::select! {
-            Some(result) = running.next() => match result {
+            Some((upstream, result)) = running.next() => match result {
                 Ok(resp) => {
+                    // Set here, in the query's own task: losers finishing
+                    // in the background task below can't overwrite it.
+                    set_source(Source::Upstream(Arc::clone(upstream.label())));
                     if !running.is_empty() {
                         tokio::spawn(async move { while running.next().await.is_some() {} });
                     }

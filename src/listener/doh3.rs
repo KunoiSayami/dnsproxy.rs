@@ -64,7 +64,7 @@ pub async fn serve(
 
     tracing::info!(addr = %bound_addr, "listening for doh3 queries");
 
-    tokio::spawn(async move {
+    crate::listener::spawn_accept_loop(async move {
         accept_loop(endpoint, handler, credentials, routes).await;
     });
 

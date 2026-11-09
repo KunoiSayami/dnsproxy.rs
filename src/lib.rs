@@ -12,6 +12,8 @@ pub mod client;
 pub mod error;
 pub mod listener;
 pub mod options;
+pub mod shutdown;
+pub mod stats;
 
 pub use cache::{Cache, CacheOptions};
 #[cfg(feature = "dnscrypt")]
@@ -30,5 +32,5 @@ pub use error::DohError;
 pub use listener::Credentials;
 #[cfg(feature = "doh-server")]
 pub use listener::DohRoutes;
-pub use listener::{Handler, serve, serve_all, with_servfail};
+pub use listener::{Handler, serve, serve_all, serve_all_split, with_servfail};
 pub use options::{HttpVersion, Options};

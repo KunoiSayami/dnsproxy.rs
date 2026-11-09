@@ -3,8 +3,8 @@
 //! [`DoqUpstream`], [`PlainUdpUpstream`], and [`PlainTcpUpstream`] behind one
 //! type so [`crate::client::upstream_config::UpstreamConfig`] can mix all of them.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
@@ -19,6 +19,8 @@ use crate::client::dot::DotUpstream;
 use crate::client::plain_tcp::PlainTcpUpstream;
 use crate::client::plain_udp::PlainUdpUpstream;
 use crate::error::DohError;
+use crate::stats::UpstreamCounters;
+use crate::stats::label::{error_kind, upstream_label};
 
 /// A configured upstream DNS server, over DoH/DoH3, DoT, DoQ, DNSCrypt,
 /// plain UDP, or plain TCP.
@@ -46,6 +48,23 @@ impl Upstream {
             Upstream::DnsCrypt(u) => u.address(),
             Upstream::PlainUdp(u) => u.address(),
             Upstream::PlainTcp(u) => u.address(),
+        }
+    }
+
+    /// The transport this upstream uses, for stats: `"udp"` (plain UDP,
+    /// DoQ, DoH over HTTP/3, DNSCrypt) or `"tcp"` (plain TCP, DoT, DoH over
+    /// HTTP/2 or 1.1).
+    pub fn transport(&self) -> &'static str {
+        match self {
+            Upstream::Doh(u) => u.transport(),
+            #[cfg(feature = "dot")]
+            Upstream::Dot(_) => "tcp",
+            #[cfg(feature = "doq")]
+            Upstream::Doq(_) => "udp",
+            #[cfg(feature = "dnscrypt")]
+            Upstream::DnsCrypt(_) => "udp",
+            Upstream::PlainUdp(_) => "udp",
+            Upstream::PlainTcp(_) => "tcp",
         }
     }
 
@@ -135,14 +154,46 @@ impl LatencyTracker {
 pub struct TrackedUpstream {
     upstream: Arc<Upstream>,
     latency: LatencyTracker,
+    /// The stats label, as `dnsstat.py` writes it; see
+    /// [`crate::stats::label::upstream_label`].
+    label: Arc<str>,
+    /// Exchange counters since the stats were last taken.
+    counters: Mutex<UpstreamCounters>,
 }
 
 impl TrackedUpstream {
+    /// Wraps `upstream`, labelled for stats from its (redacted) address.
+    /// Prefer [`Self::with_label`] with the configured address string,
+    /// which keeps an `h3://` scheme that the address normalizes away.
     pub fn new(upstream: Arc<Upstream>) -> Self {
+        let label = upstream_label(upstream.address());
+        Self::with_label(upstream, label)
+    }
+
+    /// Wraps `upstream` under the stats label `label`.
+    pub fn with_label(upstream: Arc<Upstream>, label: String) -> Self {
         Self {
             upstream,
             latency: LatencyTracker::new(),
+            label: label.into(),
+            counters: Mutex::new(UpstreamCounters::default()),
         }
+    }
+
+    /// The stats label.
+    pub fn label(&self) -> &Arc<str> {
+        &self.label
+    }
+
+    /// Returns the exchange counters accumulated since the last call and
+    /// resets them.
+    pub fn take_counters(&self) -> UpstreamCounters {
+        std::mem::take(&mut *self.counters())
+    }
+
+    fn counters(&self) -> std::sync::MutexGuard<'_, UpstreamCounters> {
+        // Counters stay usable even if a panic poisoned the lock.
+        self.counters.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn upstream(&self) -> &Arc<Upstream> {
@@ -164,11 +215,20 @@ impl TrackedUpstream {
     /// nothing.
     pub async fn exchange(&self, req: &Message) -> Result<Message, DohError> {
         let start = Instant::now();
+        self.counters().record_sent();
         let result = self.upstream.exchange(req).await;
-        self.latency.record(match result {
-            Ok(_) => start.elapsed(),
-            Err(_) => FAILURE_PENALTY,
-        });
+        let elapsed = start.elapsed();
+        let transport = self.upstream.transport();
+        match &result {
+            Ok(_) => {
+                self.latency.record(elapsed);
+                self.counters().record_ok(transport, elapsed);
+            }
+            Err(e) => {
+                self.latency.record(FAILURE_PENALTY);
+                self.counters().record_err(transport, error_kind(e));
+            }
+        }
         result
     }
 }

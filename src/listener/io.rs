@@ -50,6 +50,7 @@ pub fn with_servfail(handler: Handler) -> Handler {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     tracing::warn!(error = %e, "resolving query failed; answering servfail");
+                    crate::stats::set_source(crate::stats::Source::Error);
                     Ok(fallback)
                 }
             }
@@ -67,17 +68,25 @@ pub fn with_servfail(handler: Handler) -> Handler {
 /// on platforms where dual-stack sockets are the default, and a caller can
 /// bind both families on the same port via [`serve_all`].
 pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
+    serve_split(addr, Arc::clone(&handler), handler).await
+}
+
+/// Like [`serve`], but with separate handlers for UDP and TCP queries, e.g.
+/// to count them separately in [`crate::stats::Stats`].
+pub async fn serve_split(
+    addr: SocketAddr,
+    udp_handler: Handler,
+    tcp_handler: Handler,
+) -> Result<(), DohError> {
     let udp = bind_udp(addr)?;
     let tcp = bind_tcp(addr)?;
     tracing::info!(%addr, "listening for udp and tcp dns queries");
 
-    let udp_handler = Arc::clone(&handler);
-    tokio::spawn(async move {
+    crate::listener::spawn_accept_loop(async move {
         udp_loop(udp, udp_handler).await;
     });
-
-    tokio::spawn(async move {
-        tcp_loop(tcp, handler).await;
+    crate::listener::spawn_accept_loop(async move {
+        tcp_loop(tcp, tcp_handler).await;
     });
 
     Ok(())
@@ -86,8 +95,17 @@ pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
 /// Runs [`serve`] on every address in `addrs`, so a caller can e.g. bind both
 /// an IPv4 and an IPv6 wildcard address for the same port.
 pub async fn serve_all(addrs: &[SocketAddr], handler: Handler) -> Result<(), DohError> {
+    serve_all_split(addrs, Arc::clone(&handler), handler).await
+}
+
+/// Runs [`serve_split`] on every address in `addrs`.
+pub async fn serve_all_split(
+    addrs: &[SocketAddr],
+    udp_handler: Handler,
+    tcp_handler: Handler,
+) -> Result<(), DohError> {
     for &addr in addrs {
-        serve(addr, Arc::clone(&handler)).await?;
+        serve_split(addr, Arc::clone(&udp_handler), Arc::clone(&tcp_handler)).await?;
     }
     Ok(())
 }

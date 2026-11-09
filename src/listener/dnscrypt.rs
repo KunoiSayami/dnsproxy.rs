@@ -98,7 +98,7 @@ pub async fn serve_udp(
     let bound_addr = socket.local_addr()?;
     tracing::info!(addr = %bound_addr, "listening for dnscrypt udp queries");
 
-    tokio::spawn(async move {
+    crate::listener::spawn_accept_loop(async move {
         udp_loop(socket, config, handler).await;
     });
 
@@ -116,7 +116,7 @@ pub async fn serve_tcp(
     let bound_addr = listener.local_addr()?;
     tracing::info!(addr = %bound_addr, "listening for dnscrypt tcp queries");
 
-    tokio::spawn(async move {
+    crate::listener::spawn_accept_loop(async move {
         tcp_accept_loop(listener, config, handler).await;
     });
 

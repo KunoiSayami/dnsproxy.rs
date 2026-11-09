@@ -198,6 +198,24 @@ struct Args {
     #[arg(long)]
     no_timestamp: bool,
 
+    /// Write query statistics to this directory: every --stats-interval
+    /// seconds, one JSON line is appended to <dir>/<YYYY-MM-DD>.jsonl, in
+    /// the format of dnsstat.py, whose `summary` command reports on them.
+    /// Query names and client addresses are never recorded. The directory
+    /// is created with mode 0700 and files with 0600. The current interval
+    /// is written on SIGINT/SIGTERM too.
+    #[arg(long)]
+    stats_dir: Option<PathBuf>,
+
+    /// Seconds covered by each stats record; records end on multiples of
+    /// this on the wall clock (e.g. every 5 minutes on the 5-minute mark).
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..), requires = "stats_dir")]
+    stats_interval: u64,
+
+    /// Delete daily stats files older than this many days.
+    #[arg(long, default_value_t = 30, requires = "stats_dir")]
+    stats_keep_days: u32,
+
     /// Cache upstream responses in memory.
     #[arg(long)]
     cache: bool,
@@ -711,7 +729,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_addrs = args.listen_addrs();
     tracing::info!(listen = ?listen_addrs, upstream_file = ?args.upstream_file, "forwarding");
 
-    let mut handler = Arc::new(upstream_config).into_handler();
+    let upstream_config = Arc::new(upstream_config);
+    let stats = args
+        .stats_dir
+        .as_ref()
+        .map(|dir| {
+            doh_upstream::stats::Stats::new(
+                dir.clone(),
+                Duration::from_secs(args.stats_interval),
+                args.stats_keep_days,
+                upstream_config.upstreams_with_roles(),
+            )
+            .map(Arc::new)
+            .map_err(|e| format!("creating stats directory {}: {e}", dir.display()))
+        })
+        .transpose()?;
+    if let Some(dir) = &args.stats_dir {
+        tracing::info!(dir = %dir.display(), interval = args.stats_interval, "writing stats");
+    }
+
+    let mut handler = Arc::clone(&upstream_config).into_handler();
     if args.cache {
         let cache_opts = CacheOptions {
             size: NonZeroUsize::new(args.cache_size).ok_or("--cache-size must be nonzero")?,
@@ -724,7 +761,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Outermost, so every listener answers SERVFAIL when resolution fails
     // and the cache never stores those replies.
     let handler = doh_upstream::with_servfail(handler);
-    doh_upstream::serve_all(&listen_addrs, handler.clone()).await?;
+
+    // Each listener gets its own wrapper, so stats count queries by
+    // transport; in-flight tracking goes outermost, for shutdown.
+    let in_flight = Arc::new(doh_upstream::shutdown::InFlight::default());
+    let listener_handler = |proto: &'static str| {
+        let handler = match &stats {
+            Some(stats) => stats.wrap(handler.clone(), proto),
+            None => handler.clone(),
+        };
+        in_flight.wrap(handler)
+    };
+
+    doh_upstream::serve_all_split(
+        &listen_addrs,
+        listener_handler("udp"),
+        listener_handler("tcp"),
+    )
+    .await?;
 
     #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
     {
@@ -779,7 +833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 doh_upstream::listener::doq::serve_all(
                     &quic_addrs,
                     Arc::new(tls_config),
-                    handler.clone(),
+                    listener_handler("quic"),
                 )
                 .await?;
             }
@@ -792,7 +846,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 doh_upstream::listener::dot::serve_all(
                     &tls_addrs,
                     Arc::new(tls_config),
-                    handler.clone(),
+                    listener_handler("tls"),
                 )
                 .await?;
             }
@@ -822,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 doh_upstream::listener::doh::serve_all(
                     &https_addrs,
                     Arc::clone(&tls_config),
-                    handler.clone(),
+                    listener_handler("https"),
                     Arc::clone(&doh_credentials),
                     Arc::clone(&doh_routes),
                 )
@@ -834,7 +888,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     doh_upstream::listener::doh3::serve_all(
                         &https_addrs,
                         tls_config,
-                        handler.clone(),
+                        listener_handler("h3"),
                         Arc::clone(&doh_credentials),
                         Arc::clone(&doh_routes),
                     )
@@ -873,14 +927,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &dnscrypt_addrs,
                 &dnscrypt_addrs,
                 Arc::new(server_config),
-                handler.clone(),
+                listener_handler("dnscrypt"),
             )
             .await?;
         }
     }
 
-    // `serve` spawns its listeners and returns once bound; block forever so
-    // the process keeps running them.
-    std::future::pending::<()>().await;
+    // The listeners run in spawned tasks; wait for a stop signal, then shut
+    // down gracefully: stop accepting, let in-flight queries finish, and
+    // write the last (partial) stats interval.
+    let flusher = stats.as_ref().map(|stats| stats.spawn_flusher());
+    let signal = doh_upstream::shutdown::wait_for_signal().await?;
+    tracing::info!(signal, "shutting down");
+    doh_upstream::listener::stop_accepting();
+    if !in_flight.wait_idle(SHUTDOWN_GRACE).await {
+        tracing::warn!(
+            in_flight = in_flight.count(),
+            "abandoning queries still in flight"
+        );
+    }
+    if let Some(flusher) = flusher {
+        flusher.abort();
+    }
+    if let Some(stats) = &stats {
+        stats.flush().await;
+    }
+    tracing::info!("stopped");
     Ok(())
 }
+
+/// How long shutdown waits for in-flight queries, well within systemd's
+/// default 90 s stop timeout (and cngz1's 10 s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);

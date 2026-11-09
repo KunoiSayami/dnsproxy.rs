@@ -99,18 +99,40 @@ impl Upstream {
 /// timeout. The EMA sinks it after one failure and lets it recover after a
 /// handful of successes.
 ///
+/// It also keeps, from successful exchanges only, a smoothed latency and its
+/// mean deviation, as TCP does for its retransmit timeout (RFC 6298). Load
+/// balance uses these to decide when an answer is overdue and the next
+/// upstream should be started; see [`Self::overdue_after`].
+///
 /// One tracker is shared per distinct upstream (matching the `Arc<Upstream>`
 /// interning done during parsing), so the same server ages a single average
 /// no matter how many domain rules reference it.
 #[derive(Default)]
 pub struct LatencyTracker {
-    /// Exponential moving average latency in microseconds, or `u64::MAX`
-    /// while no exchange has completed yet.
+    /// Exponential moving average latency in microseconds, failures counted
+    /// as [`FAILURE_PENALTY`], or `u64::MAX` while no exchange has completed
+    /// yet.
     avg_micros: AtomicU64,
+    /// RFC 6298's SRTT (high 32 bits) and RTTVAR (low 32 bits) over
+    /// successful exchanges, in microseconds, or `u64::MAX` while none has
+    /// succeeded. Packed so the pair always updates together.
+    spread: AtomicU64,
 }
 
 /// Weight given to the newest sample in the exponential moving average.
 const EMA_ALPHA: f64 = 0.3;
+
+/// RFC 6298's weights for the newest sample in SRTT and RTTVAR.
+const SRTT_ALPHA: f64 = 1.0 / 8.0;
+const RTTVAR_BETA: f64 = 1.0 / 4.0;
+
+/// RFC 6298's K: an answer is overdue after SRTT + K × RTTVAR.
+const RTTVAR_K: u32 = 4;
+
+/// Largest sample [`LatencyTracker::spread`] holds, in microseconds (about
+/// 71 minutes); one less than `u32::MAX` so a packed pair can never equal
+/// the `u64::MAX` "no sample" marker.
+const SPREAD_MAX_MICROS: u64 = u32::MAX as u64 - 1;
 
 /// Latency recorded for a failed exchange, however long it actually took,
 /// so a failing upstream sinks in load-balance mode instead of keeping its
@@ -124,11 +146,24 @@ impl LatencyTracker {
     pub fn new() -> Self {
         Self {
             avg_micros: AtomicU64::new(u64::MAX),
+            spread: AtomicU64::new(u64::MAX),
         }
     }
 
-    /// Records how long an exchange with this upstream took.
+    /// Records how long a successful exchange with this upstream took.
     pub fn record(&self, elapsed: Duration) {
+        self.record_average(elapsed);
+        self.record_spread(elapsed);
+    }
+
+    /// Records a failed exchange as [`FAILURE_PENALTY`] in the average only.
+    /// Folding the penalty into the deviation too would make one failure
+    /// hold [`Self::overdue_after`] near the penalty for dozens of queries.
+    pub fn record_failure(&self) {
+        self.record_average(FAILURE_PENALTY);
+    }
+
+    fn record_average(&self, elapsed: Duration) {
         let sample = elapsed.as_micros().min(u64::MAX as u128) as u64;
         self.avg_micros
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
@@ -143,6 +178,22 @@ impl LatencyTracker {
             .ok();
     }
 
+    fn record_spread(&self, elapsed: Duration) {
+        let sample = elapsed.as_micros().min(u128::from(SPREAD_MAX_MICROS)) as f64;
+        self.spread
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                let (srtt, rttvar) = match unpack_spread(prev) {
+                    None => (sample, sample / 2.0),
+                    Some((srtt, rttvar)) => (
+                        (1.0 - SRTT_ALPHA) * srtt + SRTT_ALPHA * sample,
+                        (1.0 - RTTVAR_BETA) * rttvar + RTTVAR_BETA * (srtt - sample).abs(),
+                    ),
+                };
+                Some((srtt.round() as u64) << 32 | rttvar.round() as u64)
+            })
+            .ok();
+    }
+
     /// The current average latency, or `None` if no exchange has completed
     /// yet (i.e. this upstream is untested).
     pub fn average(&self) -> Option<Duration> {
@@ -151,6 +202,22 @@ impl LatencyTracker {
             micros => Some(Duration::from_micros(micros)),
         }
     }
+
+    /// How long after sending a query its answer is overdue: SRTT + 4 ×
+    /// RTTVAR over successful exchanges, RFC 6298's retransmit timeout
+    /// without its 1 s floor. A steady upstream is overdue soon after its
+    /// usual time, a noisy one gets more slack, and failures don't count.
+    /// `None` until an exchange has succeeded.
+    pub fn overdue_after(&self) -> Option<Duration> {
+        unpack_spread(self.spread.load(Ordering::Relaxed)).map(|(srtt, rttvar)| {
+            Duration::from_micros((srtt + f64::from(RTTVAR_K) * rttvar).round() as u64)
+        })
+    }
+}
+
+/// Splits [`LatencyTracker::spread`] into SRTT and RTTVAR, in microseconds.
+fn unpack_spread(packed: u64) -> Option<(f64, f64)> {
+    (packed != u64::MAX).then(|| ((packed >> 32) as f64, (packed & u64::from(u32::MAX)) as f64))
 }
 
 /// An [`Upstream`] paired with the latency history used to rank it in
@@ -240,10 +307,10 @@ impl TrackedUpstream {
         self.counters().record_sent();
         let result = self.upstream.exchange(req).await;
         let elapsed = start.elapsed();
-        self.latency.record(match result {
-            Ok(_) => elapsed,
-            Err(_) => FAILURE_PENALTY,
-        });
+        match result {
+            Ok(_) => self.latency.record(elapsed),
+            Err(_) => self.latency.record_failure(),
+        }
         #[cfg(feature = "stats")]
         {
             let transport = self.upstream.transport();
@@ -282,5 +349,55 @@ mod tests {
         ));
         assert!(tracked.exchange(&req).await.is_err());
         assert_eq!(tracked.latency().average(), Some(FAILURE_PENALTY));
+        assert_eq!(tracked.latency().overdue_after(), None);
+    }
+
+    #[test]
+    fn overdue_after_follows_rfc_6298() {
+        let tracker = LatencyTracker::new();
+        assert_eq!(tracker.overdue_after(), None);
+
+        // First sample R: SRTT = R, RTTVAR = R/2, so R + 4 × R/2 = 3R.
+        tracker.record(Duration::from_millis(30));
+        assert_eq!(tracker.overdue_after(), Some(Duration::from_millis(90)));
+
+        // A steady upstream's RTTVAR decays, so it's overdue sooner.
+        for _ in 0..40 {
+            tracker.record(Duration::from_millis(30));
+        }
+        let steady = tracker.overdue_after().unwrap();
+        assert!(steady < Duration::from_millis(31), "{steady:?}");
+
+        // A noisy one gets more slack than twice its average.
+        let noisy = LatencyTracker::new();
+        for _ in 0..10 {
+            for ms in [30, 30, 30, 70] {
+                noisy.record(Duration::from_millis(ms));
+            }
+        }
+        let slack = noisy.overdue_after().unwrap();
+        let twice_avg = noisy.average().unwrap() * 2;
+        assert!(
+            slack > twice_avg + Duration::from_millis(15),
+            "{slack:?} vs {twice_avg:?}"
+        );
+    }
+
+    #[test]
+    fn failures_move_the_average_but_not_overdue_after() {
+        let tracker = LatencyTracker::new();
+        for _ in 0..20 {
+            tracker.record(Duration::from_millis(30));
+        }
+        let before = tracker.overdue_after();
+
+        tracker.record_failure();
+        assert!(tracker.average().unwrap() > Duration::from_secs(1));
+        assert_eq!(tracker.overdue_after(), before);
+
+        // Nor does the first success after it inflate the deviation, as it
+        // would if measured against the penalty-laden average.
+        tracker.record(Duration::from_millis(30));
+        assert!(tracker.overdue_after().unwrap() < Duration::from_millis(40));
     }
 }

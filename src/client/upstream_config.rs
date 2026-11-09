@@ -70,9 +70,11 @@ pub enum UpstreamMode {
     ///
     /// Unlike Go, attempts are hedged rather than strictly sequential: if
     /// the upstream being tried hasn't answered within [`hedge_delay`]
-    /// (about twice its average latency), the next one is started alongside
-    /// it, and whichever answers first wins. A silently failing upstream
-    /// then costs a short delay instead of the full `--timeout`.
+    /// (its smoothed latency plus four mean deviations, as TCP's retransmit
+    /// timeout), the next one is started alongside it, and whichever answers
+    /// first wins. A silently failing upstream then costs a short delay
+    /// instead of the full `--timeout`, while an upstream's ordinary slow
+    /// answers rarely trigger a hedge.
     LoadBalance,
 
     /// Send each query to every upstream in the group at once and use the
@@ -92,13 +94,20 @@ const HEDGE_DELAY_MIN: Duration = Duration::from_millis(50);
 const HEDGE_DELAY_MAX: Duration = Duration::from_secs(1);
 
 /// How long [`UpstreamMode::LoadBalance`] waits for `upstream` to answer
-/// before also starting the next one: twice its average latency, clamped to
+/// before also starting the next one: when its answer is overdue
+/// ([`crate::client::upstream::LatencyTracker::overdue_after`], SRTT + 4 ×
+/// RTTVAR over its successful exchanges), clamped to
 /// [`HEDGE_DELAY_MIN`]..=[`HEDGE_DELAY_MAX`].
+///
+/// Twice the average latency, used before, hedged on an upstream's ordinary
+/// slow answers: on cngz1 about 15% more exchanges than uncached queries.
 fn hedge_delay(upstream: &TrackedUpstream) -> Duration {
-    upstream.latency().average().map_or(HEDGE_DELAY_MAX, |avg| {
-        avg.saturating_mul(2)
-            .clamp(HEDGE_DELAY_MIN, HEDGE_DELAY_MAX)
-    })
+    upstream
+        .latency()
+        .overdue_after()
+        .map_or(HEDGE_DELAY_MAX, |t| {
+            t.clamp(HEDGE_DELAY_MIN, HEDGE_DELAY_MAX)
+        })
 }
 
 /// One domain rule's or the default group's upstreams, plus the state
@@ -963,9 +972,7 @@ mod tests {
 
         // One failure: average ≈ 0.3 * 5 s + 0.7 * 5 ms ≈ 1.5 s, so first
         // only ~3% of the time.
-        flaky
-            .latency()
-            .record(crate::client::upstream::FAILURE_PENALTY);
+        flaky.latency().record_failure();
         let after_failure = first_pick_shares(&cfg, "example.com.", 10_000)
             .get(&flaky_addr)
             .copied()
@@ -1219,6 +1226,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let total = a_hits.load(Ordering::SeqCst) + b_hits.load(Ordering::SeqCst);
         assert_eq!(total, 1);
+    }
+
+    #[tokio::test]
+    async fn load_balance_does_not_hedge_an_upstreams_usual_slow_answers() {
+        // Steady 30 ms answers with an occasional 70 ms one: SRTT ≈ 38 ms,
+        // RTTVAR ≈ 14 ms, so overdue after ≈ 94 ms. Twice the average
+        // (≈ 71 ms) would hedge this 75 ms answer.
+        let (slowish, slowish_hits) = udp_server(Some(Duration::from_millis(75))).await;
+        let (other, other_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let cfg = udp_config(
+            &[slowish, other],
+            UpstreamMode::LoadBalance,
+            Duration::from_secs(2),
+        );
+        let slowish_tracked = tracked(&cfg, slowish);
+        for _ in 0..10 {
+            for ms in [70, 30, 30, 30] {
+                slowish_tracked.latency().record(Duration::from_millis(ms));
+            }
+        }
+        // Far slower, so `slowish` is drawn first ~99.99% of the time.
+        tracked(&cfg, other)
+            .latency()
+            .record(Duration::from_secs(10));
+        let delay = hedge_delay(&slowish_tracked);
+        assert!(delay > Duration::from_millis(85), "{delay:?}");
+
+        cfg.exchange(&query()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(slowish_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn hedge_delay_ignores_failure_penalties() {
+        let cfg = UpstreamConfig::parse_with_mode(
+            &["[/example.com/]https://1.1.1.1/dns-query"],
+            &opts(),
+            UpstreamMode::LoadBalance,
+        )
+        .unwrap();
+        let upstream = &cfg.upstreams_for("example.com.")[0];
+        assert_eq!(hedge_delay(upstream), HEDGE_DELAY_MAX);
+
+        for _ in 0..20 {
+            upstream.latency().record(Duration::from_millis(40));
+        }
+        let before = hedge_delay(upstream);
+        assert!(before < Duration::from_millis(60), "{before:?}");
+
+        // A failure sinks the upstream's weight but leaves the hedge delay.
+        upstream.latency().record_failure();
+        assert_eq!(hedge_delay(upstream), before);
     }
 
     fn udp_line(domains: &str, addrs: &[std::net::SocketAddr]) -> String {

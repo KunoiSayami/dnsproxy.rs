@@ -66,10 +66,12 @@ impl LocalTime {
 /// reads `TZ` and `/etc/localtime`.
 #[cfg(unix)]
 fn utc_offset_secs(epoch: i64) -> i64 {
-    // Infallible where `time_t` is 64-bit, but not on 32-bit targets with a
-    // 32-bit `time_t` (some OpenWrt devices).
-    #[allow(irrefutable_let_patterns)]
-    let Ok(t) = libc::time_t::try_from(epoch) else {
+    // Converted to `time_t`, inferred from `localtime_r`'s signature: the
+    // `libc` crate deprecates naming the alias on musl, where its width is
+    // set to change. Infallible where it's 64-bit, but not on 32-bit
+    // targets with a 32-bit `time_t` (some OpenWrt devices).
+    #[allow(irrefutable_let_patterns, clippy::useless_conversion)]
+    let Ok(t) = epoch.try_into() else {
         return 0;
     };
     // SAFETY: `localtime_r` is the reentrant variant: it only reads `t` and

@@ -1,0 +1,126 @@
+name: Release
+
+# Pushing a tag like v0.25.0 (matching Cargo.toml's version) tests, builds
+# static musl binaries, and publishes them with SHA-256 checksums as a GitHub
+# release. Running it by hand builds the binaries as artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Default features plus every listener and the query statistics.
+  FEATURES: all-server,stats
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - run: rustup update stable && rustup default stable
+
+      - name: Test with stats
+        run: cargo test --locked --features "$FEATURES"
+
+      - name: Test without stats
+        run: cargo test --locked --features all-server
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          # Built natively on an Arm runner, so the binary can be run below.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - run: rustup update stable && rustup default stable && rustup target add "$TARGET"
+
+      - name: Build
+        run: |
+          target_upper=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          # musl-gcc compiles ring's C and assembly code for the target.
+          export "CC_${TARGET//-/_}=musl-gcc"
+          # Native build: override the aarch64 cross-linker that
+          # .cargo/config.toml sets for local cross-compiling.
+          export "CARGO_TARGET_${target_upper}_LINKER=cc"
+          cargo build --locked --profile openwrt --target "$TARGET" --features "$FEATURES"
+
+      - name: Check the binary is static and runs
+        run: |
+          bin="target/$TARGET/openwrt/doh-upstream"
+          file "$bin"
+          file "$bin" | grep -Eq 'static-pie linked|statically linked'
+          "$bin" --version
+
+      - name: Package with a checksum
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          name="doh-upstream-$version-$TARGET"
+          mkdir dist
+          cp "target/$TARGET/openwrt/doh-upstream" "dist/$name"
+          cd dist
+          sha256sum "$name" > "$name.sha256"
+          cat "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums and combine them
+        run: |
+          cd dist
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

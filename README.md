@@ -142,6 +142,28 @@ Memory use differs too: a cached response here takes about 1 KiB (measured
 with typical two-record answers; larger answers take more), so 4000 entries
 use about 4 MiB. Go's optimistic cache (serving stale answers) isn't ported.
 
+## Release binaries
+
+Each `v*` tag publishes static Linux binaries (musl, no glibc dependency, so
+they run on any distribution) built by
+[.github/workflows/release.yml](.github/workflows/release.yml), with the
+default features plus `all-server` and `stats`:
+
+- `doh-upstream-<version>-x86_64-unknown-linux-musl`
+- `doh-upstream-<version>-aarch64-unknown-linux-musl`
+
+Each comes with a `.sha256` file, and `SHA256SUMS` lists them all. To verify
+a download:
+
+```sh
+sha256sum -c doh-upstream-<version>-x86_64-unknown-linux-musl.sha256
+```
+
+To publish a release, bump `version` in `Cargo.toml`, commit, and push a
+matching tag (`v` plus the version); the workflow refuses a tag that doesn't
+match. Running the workflow by hand builds the binaries as artifacts without
+publishing.
+
 ## Building
 
 ```sh

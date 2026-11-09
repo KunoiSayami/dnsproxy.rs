@@ -15,7 +15,7 @@ use hickory_proto::op::Message;
 use rand::seq::SliceRandom;
 
 use crate::client::upstream::TrackedUpstream;
-use crate::client::upstream_url::parse_any_upstream;
+use crate::client::upstream_url::{parse_any_upstream, redact_url};
 use crate::error::DohError;
 use crate::listener::io::Handler;
 use crate::options::Options;
@@ -161,7 +161,7 @@ impl UpstreamConfig {
                             built
                         }
                         Err(e) => {
-                            errors.push((idx, format!("upstream {u:?}: {e}")));
+                            errors.push((idx, format!("upstream {:?}: {e}", redact_url(u))));
                             continue;
                         }
                     },
@@ -251,6 +251,18 @@ impl UpstreamConfig {
             "no upstreams configured for {name:?}"
         ))))
     }
+}
+
+/// Redacts every upstream address in one config line (or `--upstream`
+/// value) with [`redact_url`], keeping any `[/domain/]` prefix, so the line
+/// can be logged without leaking credentials or secret paths.
+pub fn redact_rule(line: &str) -> String {
+    let (prefix, upstreams) = match line.strip_prefix("[/").and_then(|r| r.split_once("/]")) {
+        Some((domains, upstreams)) => (format!("[/{domains}/]"), upstreams),
+        None => (String::new(), line),
+    };
+    let redacted: Vec<String> = upstreams.split_whitespace().map(redact_url).collect();
+    format!("{prefix}{}", redacted.join(" "))
 }
 
 /// Splits one config line into its upstream address(es) and the domains it's
@@ -506,5 +518,29 @@ mod tests {
         let ordered = cfg.upstreams_for("example.com.");
         assert_eq!(ordered[0].address(), "https://2.2.2.2:443/dns-query");
         assert_eq!(ordered[1].address(), "https://1.1.1.1:443/dns-query");
+    }
+
+    #[test]
+    fn redact_rule_keeps_domains_and_redacts_upstreams() {
+        assert_eq!(
+            redact_rule(
+                "[/example.com/test.org/]h3://a.example/s3cr3t https://u:p@b.example/dns-query"
+            ),
+            "[/example.com/test.org/]h3://a.example/<redacted> https://b.example/dns-query"
+        );
+        assert_eq!(
+            redact_rule("https://u:p@c.example/s3cr3t"),
+            "https://c.example/<redacted>"
+        );
+    }
+
+    #[test]
+    fn parse_errors_hide_secret_paths() {
+        let errs = UpstreamConfig::parse(&["[/example.com/]ftp://u:p@h/s3cr3t"], &opts())
+            .err()
+            .unwrap();
+        assert_eq!(errs.len(), 1);
+        assert!(!errs[0].1.contains("s3cr3t"), "{}", errs[0].1);
+        assert!(!errs[0].1.contains("u:p"), "{}", errs[0].1);
     }
 }

@@ -59,7 +59,11 @@ impl DohUpstream {
     /// include a scheme.
     pub fn new(host: &str, port: Option<u16>, path: &str, opts: Options) -> Self {
         let port = port.unwrap_or(DEFAULT_PORT_DOH);
-        let addr_redacted = format!("https://{host}:{port}{path}");
+        // Never log the path itself: it may be the resolver's only secret.
+        let addr_redacted = format!(
+            "https://{host}:{port}{}",
+            crate::client::upstream_url::redact_path(path)
+        );
         let http_versions = opts.resolved_http_versions();
         let basic_auth_header = opts.basic_auth.map(|(user, pass)| {
             let credentials =

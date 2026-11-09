@@ -7,6 +7,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 
 use doh_upstream::client::bootstrap::{DohResolver, ParallelResolver, PlainResolver, Resolver};
+use doh_upstream::client::{redact_rule, redact_url};
 use doh_upstream::{
     Cache, CacheOptions, HttpVersion, Options, UpstreamConfig, UpstreamMode, parse_upstream,
 };
@@ -365,7 +366,8 @@ fn parse_bootstrap(s: &str, doh_opts: &Options) -> Result<Arc<dyn Resolver>, Str
         let upstream = parse_upstream(s, doh_opts)?;
         if upstream.host().parse::<std::net::IpAddr>().is_err() {
             return Err(format!(
-                "bootstrap {s:?} must use a literal IP host, not a hostname"
+                "bootstrap {:?} must use a literal IP host, not a hostname",
+                redact_url(s)
             ));
         }
         return Ok(Arc::new(DohResolver(upstream)));
@@ -494,10 +496,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_log(args.verbose, &args.log_level, args.no_timestamp);
 
     tracing::info!(
-        upstream = ?args.upstreams,
+        upstream = ?args.upstreams.iter().map(|u| redact_rule(u)).collect::<Vec<_>>(),
         upstream_file = ?args.upstream_file,
-        bootstrap = ?args.bootstrap,
-        private_upstream = ?args.private_upstream,
+        bootstrap = ?args.bootstrap.iter().map(|b| redact_url(b)).collect::<Vec<_>>(),
+        private_upstream = ?args.private_upstream.as_deref().map(redact_url),
         insecure = args.insecure,
         prefer_ipv6 = args.prefer_ipv6,
         cache = args.cache,

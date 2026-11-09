@@ -25,6 +25,42 @@ use crate::options::{HttpVersion, Options};
 /// Default port for plain DNS, matching Go's `defaultPortPlain`.
 const DEFAULT_PORT_PLAIN: u16 = 53;
 
+/// The one DoH path [`redact_path`] keeps: the path RFC 8484's examples use
+/// and most public resolvers serve, so it reveals nothing.
+const PUBLIC_DOH_PATH: &str = "/dns-query";
+
+/// Replaces a URL path with `/<redacted>` for logs and errors, unless it's
+/// empty, `/`, or [`PUBLIC_DOH_PATH`]. A DoH path is often the only secret
+/// guarding a private resolver (a "secret path" route, or a per-account ID
+/// as some providers use), and the Go version logs it in full.
+pub(crate) fn redact_path(path: &str) -> &str {
+    match path {
+        "" | "/" | PUBLIC_DOH_PATH => path,
+        _ => "/<redacted>",
+    }
+}
+
+/// Redacts an upstream address for logs and errors: drops any `user:pass@`
+/// userinfo, query, and fragment, and redacts the path per [`redact_path`].
+/// Addresses without a scheme (a bare `host[:port]`, or a config file path)
+/// and `sdns://` stamps, which carry only public keys and names, are
+/// returned unchanged.
+pub fn redact_url(addr: &str) -> String {
+    let Some((scheme, rest)) = addr.split_once("://") else {
+        return addr.to_owned();
+    };
+    if scheme == "sdns" {
+        return addr.to_owned();
+    }
+    // Strip through the last '@', as `extract_userinfo` does, so a password
+    // containing '/' is never mistaken for the start of the path. If the
+    // path itself has an '@', this only hides more.
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
+    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let path = &path[..path.find(['?', '#']).unwrap_or(path.len())];
+    format!("{scheme}://{authority}{}", redact_path(path))
+}
+
 /// Splits `user:pass@` userinfo out of a `scheme://user:pass@host/path` URL,
 /// since [`Uri`] treats the whole authority as opaque and won't parse it for
 /// us. Returns the credentials (if any) and the URL with userinfo removed.
@@ -54,14 +90,19 @@ fn extract_userinfo(url: &str) -> Result<(Option<(String, String)>, String), Str
 /// as a template. `h3://` forces HTTP/3-only, matching Go's `h3` scheme
 /// handling in `urlToUpstream`.
 pub fn parse_upstream(addr: &str, base_opts: &Options) -> Result<Arc<DohUpstream>, String> {
+    let shown = redact_url(addr);
     let (scheme, _) = addr
         .split_once("://")
-        .ok_or_else(|| format!("upstream {addr:?} must be an absolute URL"))?;
+        .ok_or_else(|| format!("upstream {shown:?} must be an absolute URL"))?;
 
     let http_versions = match scheme {
         "https" => None,
         "h3" => Some(vec![HttpVersion::Http3]),
-        other => return Err(format!("unsupported upstream scheme {other:?} in {addr:?}")),
+        other => {
+            return Err(format!(
+                "unsupported upstream scheme {other:?} in {shown:?}"
+            ));
+        }
     };
 
     let (basic_auth, stripped) = extract_userinfo(addr)?;
@@ -76,11 +117,11 @@ pub fn parse_upstream(addr: &str, base_opts: &Options) -> Result<Arc<DohUpstream
 
     let uri: Uri = normalized
         .parse()
-        .map_err(|e| format!("invalid upstream {addr:?}: {e}"))?;
+        .map_err(|e| format!("invalid upstream {shown:?}: {e}"))?;
 
     let host = uri
         .host()
-        .ok_or_else(|| format!("upstream {addr:?} must include a host"))?
+        .ok_or_else(|| format!("upstream {shown:?} must include a host"))?
         .to_owned();
     let path = uri.path().to_owned();
     let port = uri.port_u16();
@@ -164,7 +205,8 @@ pub fn parse_any_upstream(addr: &str, base_opts: &Options) -> Result<Upstream, S
                 SocketAddr::new(ip, DEFAULT_PORT_PLAIN)
             } else {
                 return Err(format!(
-                    "plain upstream {addr:?} must use a literal IP host"
+                    "plain upstream {:?} must use a literal IP host",
+                    redact_url(addr)
                 ));
             };
 
@@ -316,5 +358,61 @@ mod tests {
     fn parses_quic_scheme_upstream_with_port() {
         let u = parse_any_upstream("quic://1.1.1.1:8853", &Options::default()).unwrap();
         assert_eq!(u.address(), "quic://1.1.1.1:8853");
+    }
+
+    #[test]
+    fn redact_url_hides_credentials_and_secret_paths() {
+        for (input, expected) in [
+            (
+                "https://dns.google/dns-query",
+                "https://dns.google/dns-query",
+            ),
+            (
+                "h3://user:pass@doh.example:8443/s3cr3t/dns-query",
+                "h3://doh.example:8443/<redacted>",
+            ),
+            // A '/' in the password must not be taken for the path.
+            (
+                "https://user:pa/ss@doh.example/s3cr3t",
+                "https://doh.example/<redacted>",
+            ),
+            (
+                "https://doh.example/dns-query?token=s3cr3t#frag",
+                "https://doh.example/dns-query",
+            ),
+            ("https://doh.example", "https://doh.example"),
+            ("https://doh.example/", "https://doh.example/"),
+            ("tls://user:pass@dns.example:853", "tls://dns.example:853"),
+            ("1.1.1.1:53", "1.1.1.1:53"),
+            ("/etc/dnsproxy/upstream.conf", "/etc/dnsproxy/upstream.conf"),
+            ("sdns://AQcAAAAAAAAA", "sdns://AQcAAAAAAAAA"),
+        ] {
+            assert_eq!(redact_url(input), expected, "for {input:?}");
+        }
+    }
+
+    #[test]
+    fn doh_upstream_address_hides_secret_path() {
+        let u = parse_upstream(
+            "h3://user:pass@doh.example:8443/s3cr3t/dns-query",
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(u.address(), "https://doh.example:8443/<redacted>");
+    }
+
+    #[test]
+    fn parse_errors_hide_credentials_and_secret_paths() {
+        let err = parse_upstream("https://user:pass@/s3cr3t", &Options::default())
+            .err()
+            .unwrap();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        assert!(!err.contains("pass"), "{err}");
+
+        let err = parse_any_upstream("ftp://user:pass@host/s3cr3t", &Options::default())
+            .err()
+            .unwrap();
+        assert!(!err.contains("s3cr3t"), "{err}");
+        assert!(!err.contains("pass"), "{err}");
     }
 }

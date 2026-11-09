@@ -121,19 +121,21 @@ impl DohUpstream {
 
         let (client, was_cached) = self.get_client().await?;
 
-        match self.exchange_https(&client, req).await {
-            Ok(resp) => Ok(resp),
+        let result = match self.exchange_https(&client, req).await {
             Err(e) if was_cached && e.should_retry() => {
                 tracing::debug!(addr = %self.addr_redacted, error = %e, "retrying with a fresh client");
                 let client = self.reset_client().await?;
                 self.exchange_https(&client, req).await
             }
-            Err(e) => {
-                tracing::warn!(addr = %self.addr_redacted, error = %e, "exchange failed");
-                self.reset_client_ignore_err().await;
-                Err(e)
-            }
+            other => other,
+        };
+        if let Err(e) = &result {
+            tracing::warn!(addr = %self.addr_redacted, error = %e, "exchange failed");
+            self.reset_client_ignore_err().await;
+            #[cfg(feature = "http3")]
+            self.forget_h3_probe().await;
         }
+        result
     }
 
     /// The transport this upstream's exchanges currently use, for stats:
@@ -224,12 +226,10 @@ impl DohUpstream {
             .first()
             .ok_or_else(|| DohError::Bootstrap(format!("no addresses for {}", self.host)))?;
 
-        let tls_config =
-            build_tls_config(&self.host, self.insecure_skip_verify, vec![b"h2".to_vec()]);
         let prefer = crate::client::doh3::probe_h3(
             addr,
             &self.host,
-            Arc::new(tls_config),
+            Arc::new(self.probe_tls_config()),
             self.timeout,
             true,
         )
@@ -239,23 +239,45 @@ impl DohUpstream {
         Ok(prefer)
     }
 
+    /// The TLS config both HTTP/3 probes use: every configured version's
+    /// ALPN, as Go's probe uses the upstream's `tlsConf`. Offering only `h2`
+    /// would make HTTP/3 servers refuse the QUIC handshake
+    /// (`no_application_protocol`), so QUIC would lose every race.
+    #[cfg(feature = "http3")]
+    pub(crate) fn probe_tls_config(&self) -> tokio_rustls::rustls::ClientConfig {
+        let alpns = self
+            .http_versions
+            .iter()
+            .map(|v| v.alpn().as_bytes().to_vec())
+            .collect();
+        build_tls_config(&self.host, self.insecure_skip_verify, alpns)
+    }
+
+    /// Makes the next exchange probe HTTP/3 against HTTP/2 again, as Go
+    /// re-runs `probeH3` whenever it recreates the client after an error.
+    #[cfg(feature = "http3")]
+    async fn forget_h3_probe(&self) {
+        *self.prefer_h3.lock().await = None;
+    }
+
     #[cfg(feature = "http3")]
     async fn exchange_h3(&self, req: &Message) -> Result<Message, DohError> {
         let (transport, was_cached) = self.get_h3_transport().await?;
 
-        match transport.exchange(req).await {
-            Ok(resp) => Ok(resp),
+        let result = match transport.exchange(req).await {
             Err(e) if was_cached && e.should_retry() => {
                 tracing::debug!(addr = %self.addr_redacted, error = %e, "retrying http/3 with a fresh transport");
                 transport.reset().await?;
                 transport.exchange(req).await
             }
-            Err(e) => {
-                tracing::warn!(addr = %self.addr_redacted, error = %e, "http/3 exchange failed");
-                *self.h3.lock().await = None;
-                Err(e)
-            }
+            other => other,
+        };
+        if let Err(e) = &result {
+            tracing::warn!(addr = %self.addr_redacted, error = %e, "http/3 exchange failed");
+            *self.h3.lock().await = None;
+            self.forget_h3_probe().await;
         }
+        result
     }
 
     #[cfg(feature = "http3")]

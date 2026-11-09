@@ -222,7 +222,7 @@ pub async fn probe_h3(
         let server_name = server_name.to_owned();
         async move {
             let start = Instant::now();
-            let result = probe_tls(addr, &server_name).await;
+            let result = probe_tls(addr, &server_name, tls_config).await;
             (result.is_ok(), start.elapsed())
         }
     };
@@ -248,18 +248,19 @@ pub async fn probe_h3(
     prefer_h3
 }
 
-async fn probe_tls(addr: SocketAddr, server_name: &str) -> Result<(), DohError> {
+/// Opens a TLS connection to `addr` with `tls_config`, the same config the
+/// QUIC probe uses (so `insecure_skip_verify` applies to both), as Go's
+/// `probeTLS` does.
+async fn probe_tls(
+    addr: SocketAddr,
+    server_name: &str,
+    tls_config: Arc<rustls::ClientConfig>,
+) -> Result<(), DohError> {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(DohError::Io)?;
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
     let name = rustls_pki_types::ServerName::try_from(server_name.to_owned())
         .map_err(|e| DohError::Http(format!("invalid server name: {e}")))?;
 
@@ -269,4 +270,119 @@ async fn probe_tls(addr: SocketAddr, server_name: &str) -> Result<(), DohError> 
         .map_err(|e| DohError::Http(e.to_string()))?;
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "http3-server"))]
+mod tests {
+    use super::*;
+    use crate::DohUpstream;
+    use crate::client::doh::build_tls_config;
+    use crate::listener::{Credentials, DohRoutes, Handler};
+    use crate::options::{HttpVersion, Options};
+    use hickory_proto::op::{MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+
+    fn server_tls_config(alpn: &[&[u8]]) -> Arc<tokio_rustls::rustls::ServerConfig> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key_der = tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.signing_key.serialize_der().into(),
+        );
+        let mut config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key_der)
+            .unwrap();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Arc::new(config)
+    }
+
+    fn echo_handler() -> Handler {
+        Arc::new(|req: Message| {
+            Box::pin(async move {
+                let mut resp = req.clone();
+                resp.metadata.message_type = MessageType::Response;
+                Ok(resp)
+            })
+        })
+    }
+
+    async fn doh3_listener() -> SocketAddr {
+        crate::listener::doh3::serve(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls_config(crate::listener::doh3::DOH3_ALPN),
+            echo_handler(),
+            Arc::new(Credentials::new([])),
+            Arc::new(DohRoutes::default()),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// An `https://` upstream allowing HTTP/3 alongside HTTP/2 and 1.1, so
+    /// it probes, trusting the listeners' self-signed certificates.
+    fn mixed_upstream(addr: SocketAddr) -> DohUpstream {
+        DohUpstream::new(
+            "localhost",
+            Some(addr.port()),
+            "/dns-query",
+            Options {
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
+                http_versions: vec![HttpVersion::Http3, HttpVersion::Http2, HttpVersion::Http11],
+                timeout: Some(Duration::from_secs(5)),
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn quic_probe_negotiates_h3() {
+        let addr = doh3_listener().await;
+
+        let probe_config = Arc::new(mixed_upstream(addr).probe_tls_config());
+        dial_quic(addr, "localhost", probe_config)
+            .await
+            .expect("an h3 server accepts the probe's ALPN list");
+
+        // The config the probe used to have: an HTTP/3 server refuses it.
+        let h2_only = Arc::new(build_tls_config("localhost", true, vec![b"h2".to_vec()]));
+        assert!(dial_quic(addr, "localhost", h2_only).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tls_probe_honours_insecure_skip_verify() {
+        let addr = crate::listener::doh::serve(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls_config(crate::listener::doh::DOH_ALPN),
+            echo_handler(),
+            Arc::new(Credentials::new([])),
+            Arc::new(DohRoutes::default()),
+        )
+        .await
+        .unwrap();
+
+        let probe_config = Arc::new(mixed_upstream(addr).probe_tls_config());
+        probe_tls(addr, "localhost", probe_config)
+            .await
+            .expect("a self-signed certificate passes with insecure_skip_verify");
+    }
+
+    #[tokio::test]
+    async fn https_upstream_prefers_a_working_http3_server() {
+        // Only the DoH3 listener: QUIC succeeds and TLS is refused, so the
+        // probe picks HTTP/3 whichever finishes first.
+        let addr = doh3_listener().await;
+        let upstream = mixed_upstream(addr);
+
+        let mut req = Message::new(42, MessageType::Query, OpCode::Query);
+        req.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let resp = upstream.exchange(&req).await.unwrap();
+        assert_eq!(resp.metadata.id, 42);
+        assert_eq!(upstream.transport(), "udp");
+    }
 }

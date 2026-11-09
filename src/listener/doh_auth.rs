@@ -5,46 +5,53 @@
 //! side instead.
 
 use base64::Engine;
+use base64::alphabet;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
+/// Go's `base64.StdEncoding`: padding required, but unlike the `base64`
+/// crate's `STANDARD`, non-zero unused bits in the last character are
+/// accepted (Go only rejects them in `Strict` mode).
+const GO_STD_ENCODING: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_allow_trailing_bits(true)
+        .with_decode_padding_mode(DecodePaddingMode::RequireCanonical),
+);
 
 /// A set of valid `username:password` credentials for the DoH/DoH3
 /// listeners. Any one matching pair authenticates a request; all
 /// authenticated requests are treated identically (no per-user routing).
 #[derive(Default)]
 pub struct Credentials {
-    // Stored pre-encoded (`Basic <base64>`) so each request only needs a
-    // cheap string comparison against the raw `Authorization` header value,
-    // not a decode-then-compare.
-    valid_headers: Vec<String>,
+    pairs: Vec<(String, String)>,
 }
 
 impl Credentials {
     /// Builds a credential set from `user:password` pairs, e.g. as parsed
     /// from repeated `--doh-auth` flags or lines of a `--doh-auth-file`.
     pub fn new(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
-        let valid_headers = pairs
-            .into_iter()
-            .map(|(user, pass)| {
-                let encoded =
-                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-                format!("Basic {encoded}")
-            })
-            .collect();
-        Self { valid_headers }
+        Self {
+            pairs: pairs.into_iter().collect(),
+        }
     }
 
     /// Whether this credential set has any entries. An empty set means
     /// auth-checking is disabled entirely (callers should skip the check).
     pub fn is_empty(&self) -> bool {
-        self.valid_headers.is_empty()
+        self.pairs.is_empty()
     }
 
     /// Checks whether `authorization` (the raw `Authorization` header value,
-    /// if present) matches one of the configured credentials.
+    /// if present) carries one of the configured credentials, parsed as Go's
+    /// `Request.BasicAuth` does (see [`parse_basic_auth`]).
     pub fn is_authorized(&self, authorization: Option<&str>) -> bool {
-        match authorization {
-            Some(header) => self.valid_headers.iter().any(|valid| valid == header),
-            None => false,
-        }
+        authorization
+            .and_then(parse_basic_auth)
+            .is_some_and(|(user, pass)| {
+                self.pairs.iter().any(|(u, p)| {
+                    u.as_bytes() == user.as_slice() && p.as_bytes() == pass.as_slice()
+                })
+            })
     }
 
     /// Parses one `user:password` pair, as given on the `--doh-auth` flag or
@@ -58,6 +65,25 @@ impl Credentials {
         }
         Ok((user.to_owned(), pass.to_owned()))
     }
+}
+
+/// Splits a Basic Auth header into user and password, mirroring Go's
+/// `net/http.parseBasicAuth`: the `Basic ` prefix (one space included)
+/// matches in any case, the rest must be padded standard base64, and the
+/// decoded bytes split at the first `:`. Anything else, extra spaces after
+/// the scheme included, is `None`.
+fn parse_basic_auth(header: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    const PREFIX: &str = "Basic ";
+    let scheme = header.get(..PREFIX.len())?;
+    if !scheme.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let decoded = GO_STD_ENCODING.decode(&header[PREFIX.len()..]).ok()?;
+    let colon = decoded.iter().position(|&b| b == b':')?;
+    let mut user = decoded;
+    let pass = user.split_off(colon + 1);
+    user.truncate(colon);
+    Some((user, pass))
 }
 
 #[cfg(test)]
@@ -94,6 +120,67 @@ mod tests {
         );
         assert!(!creds.is_authorized(Some(&wrong_header)));
         assert!(!creds.is_authorized(None));
+    }
+
+    fn basic(scheme: &str, user_pass: &str) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(user_pass);
+        format!("{scheme} {encoded}")
+    }
+
+    #[test]
+    fn matches_the_scheme_in_any_case() {
+        let creds = Credentials::new([("alice".to_owned(), "secret".to_owned())]);
+        for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+            assert!(
+                creds.is_authorized(Some(&basic(scheme, "alice:secret"))),
+                "{scheme}"
+            );
+        }
+        assert!(!creds.is_authorized(Some(&basic("Bearer", "alice:secret"))));
+    }
+
+    #[test]
+    fn rejects_malformed_headers_as_go_does() {
+        let creds = Credentials::new([("alice".to_owned(), "secret".to_owned())]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:secret");
+        for header in [
+            // Go's prefix is exactly `Basic ` (one space).
+            format!("Basic  {encoded}"),
+            format!("Basic\t{encoded}"),
+            format!("Basic{encoded}"),
+            format!("Basic {encoded} "),
+            "Basic".to_owned(),
+            "Basic ".to_owned(),
+            // Not base64.
+            "Basic !!!!".to_owned(),
+            // No `:` in the decoded value.
+            basic("Basic", "alicesecret"),
+        ] {
+            assert!(!creds.is_authorized(Some(&header)), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn splits_the_decoded_value_at_the_first_colon() {
+        let creds = Credentials::new([
+            ("alice".to_owned(), "pass:with:colons".to_owned()),
+            ("bob".to_owned(), String::new()),
+        ]);
+        assert!(creds.is_authorized(Some(&basic("Basic", "alice:pass:with:colons"))));
+        assert!(creds.is_authorized(Some(&basic("Basic", "bob:"))));
+        assert!(!creds.is_authorized(Some(&basic("Basic", "bob"))));
+        assert!(!creds.is_authorized(Some(&basic("Basic", "bob: "))));
+    }
+
+    #[test]
+    fn accepts_non_canonical_trailing_bits_like_go() {
+        // `YTo=` is "a:"; `YTp=` sets an unused bit in the last character,
+        // which Go's StdEncoding ignores and the crate's STANDARD rejects.
+        let creds = Credentials::new([("a".to_owned(), String::new())]);
+        assert!(creds.is_authorized(Some("Basic YTo=")));
+        assert!(creds.is_authorized(Some("Basic YTp=")));
+        // Padding is still required, as in Go.
+        assert!(!creds.is_authorized(Some("Basic YTo")));
     }
 
     #[test]

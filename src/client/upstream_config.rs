@@ -4,10 +4,11 @@
 //! matching behavior of `ParseUpstreamsConfig`/`UpstreamConfig` in Go's
 //! `proxy/upstreams.go` — hierarchical suffix matching, where a query for
 //! `mail.host.com` falls back to a rule registered for `host.com` if no more
-//! specific rule exists. Does not implement Go's `*.domain` (subdomain-only)
-//! or `[/domain/]#` (exclusion) syntax.
+//! specific rule exists — including Go's `[/*.domain/]` (subdomains only,
+//! not the domain itself), `[/domain/]#` (exclusion: use the default
+//! upstreams), and `[//]` (unqualified, single-label names) forms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -30,6 +31,15 @@ use crate::stats::{Role, RoleCollector, Source, set_source};
 
 /// A separator between labels of a domain name.
 const LABEL_SEP: char = '.';
+
+/// The key of `[//]` rules, for single-label names; Go's `UnqualifiedNames`.
+const UNQUALIFIED_NAMES: &str = "unqualified_names";
+
+/// The upstream token of an exclusion rule, `[/domain/]#`.
+const EXCLUSION: &str = "#";
+
+/// The prefix of a subdomains-only rule, `[/*.domain/]`.
+const SUBDOMAINS_ONLY: &str = "*.";
 
 /// How [`UpstreamConfig`] orders the upstreams for a query before trying
 /// them in sequence. Mirrors Go dnsproxy's `UpstreamMode` (`proxy/proxy.go`):
@@ -157,8 +167,20 @@ fn weighted_draw_key(avg: Duration, rng: &mut impl rand::RngExt) -> f64 {
 /// falling back to [`Self::default_upstreams`] for anything unmatched.
 pub struct UpstreamConfig {
     /// Rules keyed by lowercased, dot-terminated domain (e.g. `"host.com."`),
-    /// tried in order on failure.
+    /// tried in order on failure. An empty group is an exclusion
+    /// (`[/domain/]#`): the default upstreams handle it. For a domain with a
+    /// `*.` rule, the group holds that rule's upstreams. Go's
+    /// `DomainReservedUpstreams`.
     domain_upstreams: HashMap<Box<str>, UpstreamGroup>,
+
+    /// For the domains in [`Self::subdomains_only`], their own non-wildcard
+    /// rule, if any (Go's `SpecifiedDomainUpstreams`, kept only where it's
+    /// consulted).
+    specified_upstreams: HashMap<Box<str>, UpstreamGroup>,
+
+    /// Domains with a `[/*.domain/]` rule, which applies to their subdomains
+    /// but not to the domain itself. Go's `SubdomainExclusions`.
+    subdomains_only: HashSet<Box<str>>,
 
     /// Upstreams used for queries that don't match any domain rule.
     default_upstreams: UpstreamGroup,
@@ -194,6 +216,11 @@ impl UpstreamConfig {
         // that references it.
         let mut upstream_index: HashMap<String, Arc<TrackedUpstream>> = HashMap::new();
         let mut domain_upstreams: HashMap<Box<str>, UpstreamGroup> = HashMap::new();
+        let mut specified_upstreams: HashMap<Box<str>, UpstreamGroup> = HashMap::new();
+        let mut subdomains_only: HashSet<Box<str>> = HashSet::new();
+        // `*.` rules, merged over `domain_upstreams` once every line is read,
+        // as Go's `maps.Copy(domainReservedUpstreams, subdomainsOnlyUpstreams)`.
+        let mut subdomains_only_upstreams: HashMap<Box<str>, UpstreamGroup> = HashMap::new();
         let mut default_upstreams = UpstreamGroup::default();
         let mut errors = Vec::new();
 
@@ -210,6 +237,26 @@ impl UpstreamConfig {
                     continue;
                 }
             };
+
+            // `[/domain/]#`: reset the domains to "use the defaults"; later
+            // lines can still add to them. Go's `excludeFromReserved`.
+            if !domains.is_empty() && upstream_strs[0] == EXCLUSION {
+                for domain in &domains {
+                    match domain.strip_prefix(SUBDOMAINS_ONLY) {
+                        Some(base) => {
+                            subdomains_only.insert(base.into());
+                            subdomains_only_upstreams.insert(base.into(), UpstreamGroup::default());
+                        }
+                        None => {
+                            domain_upstreams
+                                .insert(domain.as_str().into(), UpstreamGroup::default());
+                            specified_upstreams
+                                .insert(domain.as_str().into(), UpstreamGroup::default());
+                        }
+                    }
+                }
+                continue;
+            }
 
             for u in &upstream_strs {
                 let upstream = match upstream_index.get(u.as_str()) {
@@ -234,13 +281,31 @@ impl UpstreamConfig {
 
                 if domains.is_empty() {
                     default_upstreams.push(upstream);
-                } else {
-                    for domain in &domains {
-                        domain_upstreams
-                            .entry(domain.as_str().into())
-                            .or_default()
-                            .push(Arc::clone(&upstream));
-                    }
+                    continue;
+                }
+                // Go's `includeToReserved`.
+                for domain in &domains {
+                    let key: &str = match domain.strip_prefix(SUBDOMAINS_ONLY) {
+                        Some(base) => {
+                            subdomains_only.insert(base.into());
+                            subdomains_only_upstreams
+                                .entry(base.into())
+                                .or_default()
+                                .push(Arc::clone(&upstream));
+                            base
+                        }
+                        None => {
+                            specified_upstreams
+                                .entry(domain.as_str().into())
+                                .or_default()
+                                .push(Arc::clone(&upstream));
+                            domain
+                        }
+                    };
+                    domain_upstreams
+                        .entry(key.into())
+                        .or_default()
+                        .push(Arc::clone(&upstream));
                 }
             }
         }
@@ -249,8 +314,13 @@ impl UpstreamConfig {
             return Err(errors);
         }
 
+        domain_upstreams.extend(subdomains_only_upstreams);
+        specified_upstreams.retain(|domain, _| subdomains_only.contains(domain));
+
         Ok(Self {
             domain_upstreams,
+            specified_upstreams,
+            subdomains_only,
             default_upstreams,
             mode,
             fallback: None,
@@ -266,7 +336,11 @@ impl UpstreamConfig {
         for upstream in &self.default_upstreams.upstreams {
             roles.add(upstream, Role::Default);
         }
-        for group in self.domain_upstreams.values() {
+        for group in self
+            .domain_upstreams
+            .values()
+            .chain(self.specified_upstreams.values())
+        {
             for upstream in &group.upstreams {
                 roles.add(upstream, Role::Domain);
             }
@@ -301,24 +375,58 @@ impl UpstreamConfig {
         group.ordered(self.mode)
     }
 
+    /// Go's `getUpstreamsForDomain`.
     fn group_for(&self, fqdn: &str) -> &UpstreamGroup {
         if self.domain_upstreams.is_empty() {
             return &self.default_upstreams;
         }
 
-        let lower = fqdn.to_ascii_lowercase();
-        let mut suffix = lower.as_str();
-        loop {
-            if let Some(group) = self.domain_upstreams.get(suffix) {
+        let fqdn = fqdn.to_ascii_lowercase();
+        if self.subdomains_only.contains(fqdn.as_str()) {
+            return self.subdomains_only_base_group(&fqdn);
+        }
+        if let Some(group) = self.lookup(&fqdn) {
+            return group;
+        }
+
+        let (first_label, mut suffix) = fqdn.split_once(LABEL_SEP).unwrap_or((&fqdn, ""));
+        if !first_label.is_empty() && suffix.is_empty() {
+            suffix = UNQUALIFIED_NAMES;
+        }
+        while !suffix.is_empty() {
+            if let Some(group) = self.lookup(suffix) {
                 return group;
             }
-            match suffix.split_once(LABEL_SEP) {
-                Some((_, rest)) if !rest.is_empty() => suffix = rest,
-                _ => break,
-            }
+            suffix = suffix.split_once(LABEL_SEP).map_or("", |(_, rest)| rest);
         }
 
         &self.default_upstreams
+    }
+
+    /// The rule for exactly `name`, the defaults if it's excluded, or `None`
+    /// if there's no rule for it. Go's `lookupUpstreams`.
+    fn lookup(&self, name: &str) -> Option<&UpstreamGroup> {
+        let group = self.domain_upstreams.get(name)?;
+        Some(if group.upstreams.is_empty() {
+            &self.default_upstreams
+        } else {
+            group
+        })
+    }
+
+    /// The group for a domain whose `*.` rule doesn't apply to itself: its
+    /// own non-wildcard rule, else its parent's rule (one level up only),
+    /// else the defaults. Go's `lookupSubdomainExclusion`.
+    fn subdomains_only_base_group(&self, domain: &str) -> &UpstreamGroup {
+        let non_empty = |group: &&UpstreamGroup| !group.upstreams.is_empty();
+        if let Some(group) = self.specified_upstreams.get(domain).filter(non_empty) {
+            return group;
+        }
+        let parent = domain.split_once(LABEL_SEP).map_or("", |(_, rest)| rest);
+        self.domain_upstreams
+            .get(parent)
+            .filter(non_empty)
+            .unwrap_or(&self.default_upstreams)
     }
 
     /// Builds a [`Handler`] that looks up the upstreams for each query's
@@ -483,8 +591,9 @@ async fn race(
 
 /// Splits one config line into its upstream address(es) and the domains it's
 /// reserved for (empty when the line is a plain default-upstream line).
-/// Mirrors `splitConfigLine` in Go's `proxy/upstreams.go`, minus the `#`
-/// exclusion marker and `*.` wildcard handling.
+/// Mirrors `splitConfigLine` in Go's `proxy/upstreams.go`: an empty domain
+/// (`[//]`) stands for unqualified names, and a `*.` prefix is kept for the
+/// caller. Domains aren't validated as Go does.
 fn split_config_line(line: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let Some(rest) = line.strip_prefix("[/") else {
         return Ok((vec![line.to_owned()], Vec::new()));
@@ -500,15 +609,19 @@ fn split_config_line(line: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let mut domains = Vec::new();
     for host in domains_part.split('/') {
         if host.is_empty() {
-            return Err("wrong upstream format: empty domain in rule".to_owned());
+            domains.push(UNQUALIFIED_NAMES.to_owned());
+        } else {
+            domains.push(format!("{}{LABEL_SEP}", host.to_ascii_lowercase()));
         }
-        domains.push(format!("{}{LABEL_SEP}", host.to_ascii_lowercase()));
     }
 
-    let upstreams = upstreams_part
+    let upstreams: Vec<String> = upstreams_part
         .split_whitespace()
         .map(str::to_owned)
         .collect();
+    if upstreams.is_empty() {
+        return Err("wrong upstream format: no upstreams after \"/]\"".to_owned());
+    }
 
     Ok((upstreams, domains))
 }
@@ -640,10 +753,97 @@ mod tests {
         assert_eq!(errs[0].0, 0);
     }
 
+    /// The first upstream's address for `name`, or `None` without any.
+    fn first(cfg: &UpstreamConfig, name: &str) -> Option<String> {
+        cfg.upstreams_for(name)
+            .first()
+            .map(|u| u.address().to_owned())
+    }
+
+    const A: &str = "https://1.1.1.1:443/dns-query";
+    const B: &str = "https://2.2.2.2:443/dns-query";
+    const D: &str = "https://9.9.9.9:443/dns-query";
+
+    fn cfg(lines: &[&str]) -> UpstreamConfig {
+        let mut all = vec!["https://9.9.9.9/dns-query"]; // the default, D
+        all.extend_from_slice(lines);
+        UpstreamConfig::parse(&all, &opts()).unwrap()
+    }
+
     #[test]
-    fn empty_domain_segment_is_rejected() {
-        let result = UpstreamConfig::parse(&["[//]https://1.1.1.1/dns-query"], &opts());
-        let Err(errs) = result else {
+    fn empty_domain_means_unqualified_names() {
+        let cfg = cfg(&["[//]https://1.1.1.1/dns-query"]);
+        assert_eq!(first(&cfg, "host.").as_deref(), Some(A));
+        assert_eq!(first(&cfg, "host.example.").as_deref(), Some(D));
+    }
+
+    #[test]
+    fn exclusion_sends_a_domain_and_its_subdomains_to_the_defaults() {
+        let cfg = cfg(&[
+            "[/example.org/]https://1.1.1.1/dns-query",
+            "[/sub.example.org/]#",
+        ]);
+        assert_eq!(first(&cfg, "example.org.").as_deref(), Some(A));
+        assert_eq!(first(&cfg, "www.example.org.").as_deref(), Some(A));
+        assert_eq!(first(&cfg, "sub.example.org.").as_deref(), Some(D));
+        assert_eq!(first(&cfg, "x.sub.example.org.").as_deref(), Some(D));
+    }
+
+    #[test]
+    fn exclusion_and_rules_apply_in_line_order() {
+        let cfg_add_after = cfg(&[
+            "[/example.org/]#",
+            "[/example.org/]https://1.1.1.1/dns-query",
+        ]);
+        assert_eq!(first(&cfg_add_after, "example.org.").as_deref(), Some(A));
+        let cfg_exclude_after = cfg(&[
+            "[/example.org/]https://1.1.1.1/dns-query",
+            "[/example.org/]#",
+        ]);
+        assert_eq!(
+            first(&cfg_exclude_after, "example.org.").as_deref(),
+            Some(D)
+        );
+    }
+
+    #[test]
+    fn wildcard_applies_to_subdomains_only() {
+        let cfg = cfg(&["[/*.example.org/]https://1.1.1.1/dns-query"]);
+        assert_eq!(first(&cfg, "example.org.").as_deref(), Some(D));
+        assert_eq!(first(&cfg, "www.example.org.").as_deref(), Some(A));
+        assert_eq!(first(&cfg, "a.b.example.org.").as_deref(), Some(A));
+    }
+
+    #[test]
+    fn wildcard_base_uses_its_own_rule_or_its_parents() {
+        let own = cfg(&[
+            "[/example.org/]https://2.2.2.2/dns-query",
+            "[/*.example.org/]https://1.1.1.1/dns-query",
+        ]);
+        assert_eq!(first(&own, "example.org.").as_deref(), Some(B));
+        assert_eq!(first(&own, "www.example.org.").as_deref(), Some(A));
+
+        let parent = cfg(&[
+            "[/org/]https://2.2.2.2/dns-query",
+            "[/*.example.org/]https://1.1.1.1/dns-query",
+        ]);
+        assert_eq!(first(&parent, "example.org.").as_deref(), Some(B));
+        assert_eq!(first(&parent, "www.example.org.").as_deref(), Some(A));
+    }
+
+    #[test]
+    fn wildcard_exclusion_keeps_the_base_domains_rule() {
+        let cfg = cfg(&[
+            "[/example.org/]https://1.1.1.1/dns-query",
+            "[/*.example.org/]#",
+        ]);
+        assert_eq!(first(&cfg, "example.org.").as_deref(), Some(A));
+        assert_eq!(first(&cfg, "www.example.org.").as_deref(), Some(D));
+    }
+
+    #[test]
+    fn rule_with_only_whitespace_after_the_domains_is_rejected() {
+        let Err(errs) = UpstreamConfig::parse(&["[/example.org/]   "], &opts()) else {
             panic!("expected a parse error");
         };
         assert_eq!(errs.len(), 1);
@@ -1103,5 +1303,116 @@ mod tests {
                 .with_fallback(fallback);
 
         assert!(cfg.exchange(&query()).await.is_err());
+    }
+
+    /// Parses `lines` and checks each `(name, upstream addresses)` case, as
+    /// Go's `assertUpstreamsAddrs` does; `udp://` is left off addresses.
+    fn assert_routes(lines: &[&str], cases: &[(&str, &[&str])]) {
+        let cfg = UpstreamConfig::parse(lines, &opts()).unwrap();
+        for (name, want) in cases {
+            let got: Vec<String> = cfg
+                .upstreams_for(name)
+                .iter()
+                .map(|u| u.address().trim_start_matches("udp://").to_owned())
+                .collect();
+            assert_eq!(&got, want, "for {name:?}");
+        }
+    }
+
+    /// Go's `TestUpstreamConfig_GetUpstreamsForDomain`.
+    #[test]
+    fn go_get_upstreams_for_domain() {
+        assert_routes(
+            &[
+                "tcp://general.upstream:53",
+                "[//]tcp://unqualified.upstream:53",
+                "[/example/]tcp://tld.upstream:53",
+                "[/*.example/]#",
+                "[/name.example/]tcp://domain.upstream:53",
+                "[/*.name.example/]tcp://wildcard.upstream:53",
+                "[/general.name.example/]#",
+                "[/sub.name.example/]tcp://subdomain.upstream:53",
+            ],
+            &[
+                ("unspecified.domain.", &["tcp://general.upstream:53"]),
+                ("unqualified.", &["tcp://unqualified.upstream:53"]),
+                (".", &["tcp://general.upstream:53"]),
+                ("example.", &["tcp://tld.upstream:53"]),
+                (
+                    "unspecified.domain.example.",
+                    &["tcp://general.upstream:53"],
+                ),
+                ("name.example.", &["tcp://domain.upstream:53"]),
+                ("another.name.example.", &["tcp://wildcard.upstream:53"]),
+                ("general.name.example.", &["tcp://general.upstream:53"]),
+                ("sub.name.example.", &["tcp://subdomain.upstream:53"]),
+            ],
+        );
+    }
+
+    /// Go's `TestUpstreamConfig_GetUpstreamsForDomain_wildcards`.
+    #[test]
+    fn go_get_upstreams_for_domain_wildcards() {
+        assert_routes(
+            &[
+                "0.0.0.1",
+                "[/a.x/]0.0.0.2",
+                "[/*.a.x/]0.0.0.3",
+                "[/b.a.x/]0.0.0.4",
+                "[/*.b.a.x/]0.0.0.5",
+                "[/*.x.z/]0.0.0.6",
+                "[/c.b.a.x/]#",
+            ],
+            &[
+                ("d.x.", &["0.0.0.1:53"]),
+                ("a.x.", &["0.0.0.2:53"]),
+                ("c.a.x.", &["0.0.0.3:53"]),
+                ("b.a.x.", &["0.0.0.4:53"]),
+                ("d.b.a.x.", &["0.0.0.5:53"]),
+                ("c.b.a.x.", &["0.0.0.1:53"]),
+                ("d.c.b.a.x.", &["0.0.0.1:53"]),
+                ("x.z.", &["0.0.0.1:53"]),
+                ("a.x.z.", &["0.0.0.6:53"]),
+            ],
+        );
+    }
+
+    /// Go's `TestUpstreamConfig_GetUpstreamsForDomain_subWildcards`.
+    #[test]
+    fn go_get_upstreams_for_domain_sub_wildcards() {
+        assert_routes(
+            &[
+                "0.0.0.1",
+                "[/a.x/]0.0.0.2",
+                "[/*.a.x/]0.0.0.3",
+                "[/*.b.a.x/]0.0.0.5",
+            ],
+            &[
+                ("a.x.", &["0.0.0.2:53"]),
+                ("c.a.x.", &["0.0.0.3:53"]),
+                ("b.a.x.", &["0.0.0.3:53"]),
+                ("d.b.a.x.", &["0.0.0.5:53"]),
+            ],
+        );
+    }
+
+    /// Go's `TestUpstreamConfig_GetUpstreamsForDomain_defaultWildcards`.
+    #[test]
+    fn go_get_upstreams_for_domain_default_wildcards() {
+        assert_routes(
+            &[
+                "127.0.0.1:5301",
+                "[/example.org/]127.0.0.1:5302",
+                "[/*.example.org/]127.0.0.1:5303",
+                "[/www.example.org/]127.0.0.1:5304",
+                "[/*.www.example.org/]#",
+            ],
+            &[
+                ("example.org.", &["127.0.0.1:5302"]),
+                ("sub.example.org.", &["127.0.0.1:5303"]),
+                ("www.example.org.", &["127.0.0.1:5304"]),
+                ("abc.www.example.org.", &["127.0.0.1:5301"]),
+            ],
+        );
     }
 }

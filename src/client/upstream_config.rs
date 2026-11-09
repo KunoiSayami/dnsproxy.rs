@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use hickory_proto::op::Message;
 use rand::seq::SliceRandom;
@@ -25,8 +26,8 @@ const LABEL_SEP: char = '.';
 
 /// How [`UpstreamConfig`] orders the upstreams for a query before trying
 /// them in sequence. Mirrors Go dnsproxy's `UpstreamMode` (`proxy/proxy.go`):
-/// `UpstreamModeLoadBalance` picks by recent latency, while the plain
-/// default mode always tries upstreams in configured order. Round-robin has
+/// `UpstreamModeLoadBalance` picks at random weighted by recent latency,
+/// while the plain default mode always tries upstreams in configured order. Round-robin has
 /// no direct Go equivalent but is offered here as a simpler alternative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamMode {
@@ -40,11 +41,15 @@ pub enum UpstreamMode {
     /// group in order.
     RoundRobin,
 
-    /// Try the upstream with the lowest recent average latency first,
-    /// falling back through the rest in ascending latency order. Untested
-    /// upstreams (no completed exchange yet) are treated as fastest and
-    /// tried in random order ahead of any measured ones, so every upstream
-    /// gets a chance to be measured.
+    /// Order upstreams by a weighted random draw without replacement, each
+    /// weighted by the inverse of its recent average latency, so traffic
+    /// spreads in proportion to speed and slower upstreams keep getting
+    /// re-measured. A failed exchange counts as a
+    /// [`crate::client::upstream::FAILURE_PENALTY`] sample, so a failing
+    /// upstream sinks to the back. Untested upstreams (no exchange recorded
+    /// yet) go first, in random order. Mirrors Go's `exchangeUpstreams` and
+    /// `calcWeights` (`proxy/exchange.go`), whose default weight of 1 for an
+    /// untested upstream likewise outranks any measured one.
     LoadBalance,
 }
 
@@ -79,22 +84,35 @@ impl UpstreamGroup {
                     .collect()
             }
             UpstreamMode::LoadBalance => {
-                let mut tested: Vec<Arc<TrackedUpstream>> = Vec::new();
+                let mut rng = rand::rng();
+                let mut tested: Vec<(f64, Arc<TrackedUpstream>)> = Vec::new();
                 let mut untested: Vec<Arc<TrackedUpstream>> = Vec::new();
                 for u in &self.upstreams {
-                    if u.latency().average().is_some() {
-                        tested.push(Arc::clone(u));
-                    } else {
-                        untested.push(Arc::clone(u));
+                    match u.latency().average() {
+                        Some(avg) => tested.push((weighted_draw_key(avg, &mut rng), Arc::clone(u))),
+                        None => untested.push(Arc::clone(u)),
                     }
                 }
-                tested.sort_by_key(|u| u.latency().average());
-                untested.shuffle(&mut rand::rng());
-                untested.extend(tested);
+                tested.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+                untested.shuffle(&mut rng);
+                untested.extend(tested.into_iter().map(|(_, u)| u));
                 untested
             }
         }
     }
+}
+
+/// A random sort key for one upstream in a weighted draw without
+/// replacement with weight `1 / avg`: sorting ascending by these keys gives
+/// the same order distribution as repeatedly drawing an upstream with
+/// probability proportional to its weight among those left, as Go's
+/// `sampleuv.Weighted.Take` does. Each key is an exponentially distributed
+/// "arrival time" with rate `1 / avg`, i.e. `-ln(U) * avg`; this stays
+/// accurate however small the weights get, unlike the `U^(1/w)` form.
+fn weighted_draw_key(avg: Duration, rng: &mut impl rand::RngExt) -> f64 {
+    // `random` is in [0, 1); flip it to (0, 1] so `ln` stays finite.
+    let u: f64 = 1.0 - rng.random::<f64>();
+    -u.ln() * avg.as_secs_f64()
 }
 
 /// Maps domain names to the upstreams that should handle queries for them,
@@ -473,30 +491,102 @@ mod tests {
         }
     }
 
+    /// Counts, over `draws` orderings, how often each address came first.
+    fn first_pick_shares(cfg: &UpstreamConfig, fqdn: &str, draws: usize) -> HashMap<String, f64> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..draws {
+            let first = cfg.upstreams_for(fqdn)[0].address().to_owned();
+            *counts.entry(first).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(addr, n)| (addr, n as f64 / draws as f64))
+            .collect()
+    }
+
     #[test]
-    fn load_balance_prefers_lower_latency_upstream() {
+    fn load_balance_spreads_load_by_inverse_latency() {
+        let cfg = UpstreamConfig::parse_with_mode(
+            &["[/example.com/]https://1.1.1.1/dns-query https://2.2.2.2/dns-query https://3.3.3.3/dns-query"],
+            &opts(),
+            UpstreamMode::LoadBalance,
+        )
+        .unwrap();
+        // Weights 1/10 : 1/40 : 1/120 = 12 : 3 : 1, so the first pick
+        // should split 75% / 18.75% / 6.25% (cngz1 sees ~73/19/7 under Go).
+        for (ip, ms) in [("1.1.1.1", 10), ("2.2.2.2", 40), ("3.3.3.3", 120)] {
+            cfg.upstreams_for("example.com.")
+                .iter()
+                .find(|u| u.address().contains(ip))
+                .unwrap()
+                .latency()
+                .record(Duration::from_millis(ms));
+        }
+
+        let shares = first_pick_shares(&cfg, "example.com.", 40_000);
+        for (addr, expected) in [
+            ("https://1.1.1.1:443/dns-query", 0.75),
+            ("https://2.2.2.2:443/dns-query", 0.1875),
+            ("https://3.3.3.3:443/dns-query", 0.0625),
+        ] {
+            let got = shares.get(addr).copied().unwrap_or(0.0);
+            // ~5 standard deviations at 40k draws.
+            assert!(
+                (got - expected).abs() < 0.012,
+                "{addr}: {got} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_balance_sinks_a_failing_upstream_and_lets_it_recover() {
         let cfg = UpstreamConfig::parse_with_mode(
             &["[/example.com/]https://1.1.1.1/dns-query https://2.2.2.2/dns-query"],
             &opts(),
             UpstreamMode::LoadBalance,
         )
         .unwrap();
-
         let group = cfg.upstreams_for("example.com.");
-        let slow = group
+        let flaky = group
             .iter()
             .find(|u| u.address().contains("1.1.1.1"))
             .unwrap();
-        let fast = group
+        let steady = group
             .iter()
             .find(|u| u.address().contains("2.2.2.2"))
             .unwrap();
-        slow.latency().record(Duration::from_millis(50));
-        fast.latency().record(Duration::from_millis(5));
+        flaky.latency().record(Duration::from_millis(5));
+        steady.latency().record(Duration::from_millis(50));
+        let flaky_addr = flaky.address().to_owned();
 
-        let ordered = cfg.upstreams_for("example.com.");
-        assert_eq!(ordered[0].address(), "https://2.2.2.2:443/dns-query");
-        assert_eq!(ordered[1].address(), "https://1.1.1.1:443/dns-query");
+        // Faster, so first ~91% of the time (weights 1/5 : 1/50).
+        let before = first_pick_shares(&cfg, "example.com.", 10_000)[&flaky_addr];
+        assert!(before > 0.85, "{before}");
+
+        // One failure: average ≈ 0.3 * 5 s + 0.7 * 5 ms ≈ 1.5 s, so first
+        // only ~3% of the time.
+        flaky
+            .latency()
+            .record(crate::client::upstream::FAILURE_PENALTY);
+        let after_failure = first_pick_shares(&cfg, "example.com.", 10_000)
+            .get(&flaky_addr)
+            .copied()
+            .unwrap_or(0.0);
+        assert!(after_failure < 0.04, "{after_failure}");
+
+        // Each success shrinks the excess by 0.7: ten bring it level with
+        // the 50 ms upstream (≈ 47 ms), eighteen nearly back to 5 ms
+        // (≈ 7 ms, first ~87% of the time).
+        for _ in 0..10 {
+            flaky.latency().record(Duration::from_millis(5));
+        }
+        let level = first_pick_shares(&cfg, "example.com.", 10_000)[&flaky_addr];
+        assert!((0.45..0.6).contains(&level), "{level}");
+        for _ in 0..8 {
+            flaky.latency().record(Duration::from_millis(5));
+        }
+        let recovered = first_pick_shares(&cfg, "example.com.", 10_000)[&flaky_addr];
+        assert!(recovered > 0.82, "{recovered}");
     }
 
     #[test]

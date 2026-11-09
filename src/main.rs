@@ -142,9 +142,10 @@ struct Args {
     /// How to order the upstreams within a rule before trying them:
     /// "ordered" always prefers the first-configured upstream, falling back
     /// to later ones only on failure; "round-robin" rotates the starting
-    /// upstream on each query; "load-balance" prefers whichever upstream has
-    /// answered fastest recently, so traffic drifts toward the quicker
-    /// server over time.
+    /// upstream on each query; "load-balance" picks at random, weighted by
+    /// each upstream's recent average latency (a failure counts as 5 s),
+    /// so traffic spreads in proportion to speed and a failing upstream
+    /// sinks until it answers again.
     #[arg(long, value_enum, default_value_t = UpstreamModeArg::Ordered)]
     upstream_mode: UpstreamModeArg,
 

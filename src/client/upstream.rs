@@ -65,10 +65,16 @@ impl Upstream {
 }
 
 /// Tracks a rolling average exchange latency for one upstream, used by
-/// [`crate::client::upstream_config::UpstreamMode::LoadBalance`] to prefer
-/// the upstream that has recently answered fastest. Mirrors the exponential
-/// moving average Go dnsproxy keeps per upstream for its load-balance mode
-/// (`proxy/upstream_lbalgorithm.go`'s `rttEma`).
+/// [`crate::client::upstream_config::UpstreamMode::LoadBalance`] to weight
+/// upstreams by how fast they've recently answered.
+///
+/// Go dnsproxy (`proxy/exchange.go`'s `upstreamRTTStats`) keeps a lifetime
+/// mean instead. This uses an exponential moving average on purpose: with a
+/// lifetime mean, a long-running proxy barely moves a dead upstream's
+/// average (after a million 50 ms samples, each 10 s failure penalty adds
+/// about 10 µs), so it keeps being tried first and every query waits out the
+/// timeout. The EMA sinks it after one failure and lets it recover after a
+/// handful of successes.
 ///
 /// One tracker is shared per distinct upstream (matching the `Arc<Upstream>`
 /// interning done during parsing), so the same server ages a single average
@@ -80,9 +86,16 @@ pub struct LatencyTracker {
     avg_micros: AtomicU64,
 }
 
-/// Weight given to the newest sample in the exponential moving average;
-/// matches Go dnsproxy's smoothing factor.
+/// Weight given to the newest sample in the exponential moving average.
 const EMA_ALPHA: f64 = 0.3;
+
+/// Latency recorded for a failed exchange, however long it actually took,
+/// so a failing upstream sinks in load-balance mode instead of keeping its
+/// good average. Go records a fixed value too
+/// (`updateRTT(u.Address(), defaultTimeout)`), but 10 s; half that lets a
+/// briefly failing upstream recover in about half the queries, while one
+/// failure still cuts a fast upstream's share to a few percent.
+pub const FAILURE_PENALTY: Duration = Duration::from_secs(5);
 
 impl LatencyTracker {
     pub fn new() -> Self {
@@ -145,13 +158,46 @@ impl TrackedUpstream {
     }
 
     /// Exchanges `req` with the wrapped upstream, recording how long it took
-    /// on success.
+    /// on success, or [`FAILURE_PENALTY`] on failure.
+    ///
+    /// A future dropped before completing (e.g. a cancelled query) records
+    /// nothing.
     pub async fn exchange(&self, req: &Message) -> Result<Message, DohError> {
         let start = Instant::now();
         let result = self.upstream.exchange(req).await;
-        if result.is_ok() {
-            self.latency.record(start.elapsed());
-        }
+        self.latency.record(match result {
+            Ok(_) => start.elapsed(),
+            Err(_) => FAILURE_PENALTY,
+        });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn failed_exchange_records_failure_penalty() {
+        // Nothing answers on this socket's port once it's dropped, so the
+        // exchange fails (refused or timed out).
+        let addr = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let tracked = TrackedUpstream::new(Arc::new(Upstream::PlainUdp(Arc::new(
+            PlainUdpUpstream::new(addr, Some(Duration::from_millis(200))),
+        ))));
+
+        let mut req = Message::new(1, MessageType::Query, OpCode::Query);
+        req.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(tracked.exchange(&req).await.is_err());
+        assert_eq!(tracked.latency().average(), Some(FAILURE_PENALTY));
     }
 }

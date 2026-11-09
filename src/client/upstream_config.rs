@@ -23,7 +23,9 @@ use crate::client::upstream_url::{parse_any_upstream, redact_url};
 use crate::error::DohError;
 use crate::listener::io::Handler;
 use crate::options::Options;
+#[cfg(feature = "stats")]
 use crate::stats::label::upstream_label;
+#[cfg(feature = "stats")]
 use crate::stats::{Role, RoleCollector, Source, set_source};
 
 /// A separator between labels of a domain name.
@@ -214,10 +216,12 @@ impl UpstreamConfig {
                     Some(existing) => Arc::clone(existing),
                     None => match parse_any_upstream(u, base_opts) {
                         Ok(built) => {
-                            let built = Arc::new(TrackedUpstream::with_label(
-                                Arc::new(built),
-                                upstream_label(u),
-                            ));
+                            #[cfg(feature = "stats")]
+                            let built =
+                                TrackedUpstream::with_label(Arc::new(built), upstream_label(u));
+                            #[cfg(not(feature = "stats"))]
+                            let built = TrackedUpstream::new(Arc::new(built));
+                            let built = Arc::new(built);
                             upstream_index.insert(u.clone(), Arc::clone(&built));
                             built
                         }
@@ -256,6 +260,7 @@ impl UpstreamConfig {
     /// Every distinct upstream in this config, with how it's used: `default`
     /// if any plain line uses it, else `domain`, and `fallback` for the
     /// upstreams of [`Self::with_fallback`]. For [`crate::stats::Stats`].
+    #[cfg(feature = "stats")]
     pub fn upstreams_with_roles(&self) -> Vec<(Arc<TrackedUpstream>, Role)> {
         let mut roles = RoleCollector::default();
         for upstream in &self.default_upstreams.upstreams {
@@ -368,7 +373,7 @@ impl UpstreamConfig {
                 for upstream in upstreams {
                     match upstream.exchange(req).await {
                         Ok(resp) => {
-                            set_source(Source::Upstream(Arc::clone(upstream.label())));
+                            note_answered_by(&upstream);
                             return Ok(resp);
                         }
                         Err(e) => last_err = Some(e),
@@ -392,6 +397,15 @@ pub fn redact_rule(line: &str) -> String {
     };
     let redacted: Vec<String> = upstreams.split_whitespace().map(redact_url).collect();
     format!("{prefix}{}", redacted.join(" "))
+}
+
+/// Records `upstream` as what answered the query being handled, for the
+/// stats; does nothing without the `stats` feature.
+fn note_answered_by(upstream: &TrackedUpstream) {
+    #[cfg(feature = "stats")]
+    set_source(Source::Upstream(Arc::clone(upstream.label())));
+    #[cfg(not(feature = "stats"))]
+    let _ = upstream;
 }
 
 /// Tries `upstreams` in order, starting each one after the previous attempt
@@ -449,7 +463,7 @@ async fn race(
                 Ok(resp) => {
                     // Set here, in the query's own task: losers finishing
                     // in the background task below can't overwrite it.
-                    set_source(Source::Upstream(Arc::clone(upstream.label())));
+                    note_answered_by(&upstream);
                     if !running.is_empty() {
                         tokio::spawn(async move { while running.next().await.is_some() {} });
                     }

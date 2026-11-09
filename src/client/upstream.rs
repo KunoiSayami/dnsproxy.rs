@@ -3,8 +3,10 @@
 //! [`DoqUpstream`], [`PlainUdpUpstream`], and [`PlainTcpUpstream`] behind one
 //! type so [`crate::client::upstream_config::UpstreamConfig`] can mix all of them.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+#[cfg(feature = "stats")]
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
@@ -19,7 +21,9 @@ use crate::client::dot::DotUpstream;
 use crate::client::plain_tcp::PlainTcpUpstream;
 use crate::client::plain_udp::PlainUdpUpstream;
 use crate::error::DohError;
+#[cfg(feature = "stats")]
 use crate::stats::UpstreamCounters;
+#[cfg(feature = "stats")]
 use crate::stats::label::{error_kind, upstream_label};
 
 /// A configured upstream DNS server, over DoH/DoH3, DoT, DoQ, DNSCrypt,
@@ -155,22 +159,36 @@ pub struct TrackedUpstream {
     upstream: Arc<Upstream>,
     latency: LatencyTracker,
     /// The stats label, as `dnsstat.py` writes it; see
-    /// [`crate::stats::label::upstream_label`].
+    /// `crate::stats::label::upstream_label`.
+    #[cfg(feature = "stats")]
     label: Arc<str>,
     /// Exchange counters since the stats were last taken.
+    #[cfg(feature = "stats")]
     counters: Mutex<UpstreamCounters>,
 }
 
 impl TrackedUpstream {
-    /// Wraps `upstream`, labelled for stats from its (redacted) address.
-    /// Prefer [`Self::with_label`] with the configured address string,
-    /// which keeps an `h3://` scheme that the address normalizes away.
+    /// Wraps `upstream`. With the `stats` feature, it's labelled from its
+    /// (redacted) address; prefer `with_label` with the configured address
+    /// string, which keeps an `h3://` scheme that the address normalizes
+    /// away.
+    #[cfg(feature = "stats")]
     pub fn new(upstream: Arc<Upstream>) -> Self {
         let label = upstream_label(upstream.address());
         Self::with_label(upstream, label)
     }
 
+    /// Wraps `upstream`.
+    #[cfg(not(feature = "stats"))]
+    pub fn new(upstream: Arc<Upstream>) -> Self {
+        Self {
+            upstream,
+            latency: LatencyTracker::new(),
+        }
+    }
+
     /// Wraps `upstream` under the stats label `label`.
+    #[cfg(feature = "stats")]
     pub fn with_label(upstream: Arc<Upstream>, label: String) -> Self {
         Self {
             upstream,
@@ -181,16 +199,19 @@ impl TrackedUpstream {
     }
 
     /// The stats label.
+    #[cfg(feature = "stats")]
     pub fn label(&self) -> &Arc<str> {
         &self.label
     }
 
     /// Returns the exchange counters accumulated since the last call and
     /// resets them.
+    #[cfg(feature = "stats")]
     pub fn take_counters(&self) -> UpstreamCounters {
         std::mem::take(&mut *self.counters())
     }
 
+    #[cfg(feature = "stats")]
     fn counters(&self) -> std::sync::MutexGuard<'_, UpstreamCounters> {
         // Counters stay usable even if a panic poisoned the lock.
         self.counters.lock().unwrap_or_else(PoisonError::into_inner)
@@ -215,18 +236,20 @@ impl TrackedUpstream {
     /// nothing.
     pub async fn exchange(&self, req: &Message) -> Result<Message, DohError> {
         let start = Instant::now();
+        #[cfg(feature = "stats")]
         self.counters().record_sent();
         let result = self.upstream.exchange(req).await;
         let elapsed = start.elapsed();
-        let transport = self.upstream.transport();
-        match &result {
-            Ok(_) => {
-                self.latency.record(elapsed);
-                self.counters().record_ok(transport, elapsed);
-            }
-            Err(e) => {
-                self.latency.record(FAILURE_PENALTY);
-                self.counters().record_err(transport, error_kind(e));
+        self.latency.record(match result {
+            Ok(_) => elapsed,
+            Err(_) => FAILURE_PENALTY,
+        });
+        #[cfg(feature = "stats")]
+        {
+            let transport = self.upstream.transport();
+            match &result {
+                Ok(_) => self.counters().record_ok(transport, elapsed),
+                Err(e) => self.counters().record_err(transport, error_kind(e)),
             }
         }
         result

@@ -204,15 +204,18 @@ struct Args {
     /// Query names and client addresses are never recorded. The directory
     /// is created with mode 0700 and files with 0600. The current interval
     /// is written on SIGINT/SIGTERM too.
+    #[cfg(feature = "stats")]
     #[arg(long)]
     stats_dir: Option<PathBuf>,
 
     /// Seconds covered by each stats record; records end on multiples of
     /// this on the wall clock (e.g. every 5 minutes on the 5-minute mark).
+    #[cfg(feature = "stats")]
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..), requires = "stats_dir")]
     stats_interval: u64,
 
     /// Delete daily stats files older than this many days.
+    #[cfg(feature = "stats")]
     #[arg(long, default_value_t = 30, requires = "stats_dir")]
     stats_keep_days: u32,
 
@@ -730,6 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(listen = ?listen_addrs, upstream_file = ?args.upstream_file, "forwarding");
 
     let upstream_config = Arc::new(upstream_config);
+    #[cfg(feature = "stats")]
     let stats = args
         .stats_dir
         .as_ref()
@@ -744,6 +748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("creating stats directory {}: {e}", dir.display()))
         })
         .transpose()?;
+    #[cfg(feature = "stats")]
     if let Some(dir) = &args.stats_dir {
         tracing::info!(dir = %dir.display(), interval = args.stats_interval, "writing stats");
     }
@@ -766,10 +771,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // transport; in-flight tracking goes outermost, for shutdown.
     let in_flight = Arc::new(doh_upstream::shutdown::InFlight::default());
     let listener_handler = |proto: &'static str| {
+        #[cfg(feature = "stats")]
         let handler = match &stats {
             Some(stats) => stats.wrap(handler.clone(), proto),
             None => handler.clone(),
         };
+        #[cfg(not(feature = "stats"))]
+        let (handler, _) = (handler.clone(), proto);
         in_flight.wrap(handler)
     };
 
@@ -936,6 +944,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The listeners run in spawned tasks; wait for a stop signal, then shut
     // down gracefully: stop accepting, let in-flight queries finish, and
     // write the last (partial) stats interval.
+    #[cfg(feature = "stats")]
     let flusher = stats.as_ref().map(|stats| stats.spawn_flusher());
     let signal = doh_upstream::shutdown::wait_for_signal().await?;
     tracing::info!(signal, "shutting down");
@@ -946,11 +955,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "abandoning queries still in flight"
         );
     }
-    if let Some(flusher) = flusher {
-        flusher.abort();
-    }
-    if let Some(stats) = &stats {
-        stats.flush().await;
+    #[cfg(feature = "stats")]
+    {
+        if let Some(flusher) = flusher {
+            flusher.abort();
+        }
+        if let Some(stats) = &stats {
+            stats.flush().await;
+        }
     }
     tracing::info!("stopped");
     Ok(())

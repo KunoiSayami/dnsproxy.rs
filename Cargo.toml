@@ -20,7 +20,7 @@ tokio = { version = "1", features = [
     "macros",
     "signal",
 ] }
-hyper ={ version = "1", features = ["client", "server", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = [
     "client-legacy",
     "server-auto",
@@ -52,7 +52,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = "0.6"
 lru = "0.19"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }
@@ -72,6 +72,10 @@ http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:http"]
 dot = ["dep:rustls"]
 doq = ["dep:quinn", "dep:rustls"]
 dnscrypt = ["dep:crypto_box", "dep:ed25519-dalek"]
+
+# Built-in query statistics (--stats-dir), written in dnsstat.py's JSONL
+# format. Without it, no per-query or per-upstream counters are kept at all.
+stats = ["dep:libc"]
 
 # Reverse (server-side) listeners: this program acts as the receiver for
 # downstream clients, forwarding what it receives to the configured

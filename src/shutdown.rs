@@ -19,7 +19,7 @@ pub struct InFlight {
 
 impl InFlight {
     /// Wraps `handler` so every query it handles is counted until its
-    /// response is ready. Wrap outermost (outside [`crate::stats::Stats`]),
+    /// response is ready. Wrap outermost (outside the stats wrapper),
     /// so a query's stats are recorded before it stops counting.
     pub fn wrap(self: &Arc<Self>, handler: Handler) -> Handler {
         let in_flight = Arc::clone(self);

@@ -78,6 +78,7 @@ impl Cache {
                 };
 
                 if let Some(resp) = cache.get(&key, req.metadata.id).await {
+                    #[cfg(feature = "stats")]
                     crate::stats::set_source(crate::stats::Source::Cache);
                     return Ok(resp);
                 }

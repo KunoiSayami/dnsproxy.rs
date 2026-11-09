@@ -13,6 +13,7 @@ pub mod error;
 pub mod listener;
 pub mod options;
 pub mod shutdown;
+#[cfg(feature = "stats")]
 pub mod stats;
 
 pub use cache::{Cache, CacheOptions};

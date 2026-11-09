@@ -50,6 +50,7 @@ pub fn with_servfail(handler: Handler) -> Handler {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     tracing::warn!(error = %e, "resolving query failed; answering servfail");
+                    #[cfg(feature = "stats")]
                     crate::stats::set_source(crate::stats::Source::Error);
                     Ok(fallback)
                 }
@@ -72,7 +73,7 @@ pub async fn serve(addr: SocketAddr, handler: Handler) -> Result<(), DohError> {
 }
 
 /// Like [`serve`], but with separate handlers for UDP and TCP queries, e.g.
-/// to count them separately in [`crate::stats::Stats`].
+/// to count them separately in the stats.
 pub async fn serve_split(
     addr: SocketAddr,
     udp_handler: Handler,

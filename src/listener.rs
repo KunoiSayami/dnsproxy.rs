@@ -16,6 +16,8 @@ pub mod doq;
 #[cfg(feature = "dot-server")]
 pub mod dot;
 pub mod io;
+#[cfg(feature = "doh-server")]
+pub(crate) mod rejections;
 #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]
 pub mod tls_config;
 

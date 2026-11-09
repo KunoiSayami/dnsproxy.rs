@@ -16,6 +16,7 @@ use crate::listener::doh::find_dns_param;
 use crate::listener::doh_auth::Credentials;
 use crate::listener::doh_routes::DohRoutes;
 use crate::listener::io::{Handler, bind_quic_server};
+use crate::listener::rejections::{self, Listener, Rejection};
 
 const MAX_MSG_SIZE: usize = 65535;
 
@@ -99,6 +100,7 @@ async fn connection_loop(
     credentials: Arc<Credentials>,
     routes: Arc<DohRoutes>,
 ) {
+    let peer = conn.remote_address();
     let quinn_conn = h3_quinn::Connection::new(conn);
     let mut h3_conn = match h3::server::Connection::new(quinn_conn).await {
         Ok(c) => c,
@@ -128,7 +130,7 @@ async fn connection_loop(
                     return;
                 }
             };
-            if let Err(e) = handle_request(req, stream, handler, credentials, routes).await {
+            if let Err(e) = handle_request(req, stream, peer, handler, credentials, routes).await {
                 tracing::warn!(error = %e, "doh3 request failed");
             }
         });
@@ -138,12 +140,14 @@ async fn connection_loop(
 async fn handle_request(
     req: Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    peer: SocketAddr,
     handler: Handler,
     credentials: Arc<Credentials>,
     routes: Arc<DohRoutes>,
 ) -> Result<(), DohError> {
     // Before auth, as Go's ServeMux does; see the DoH listener.
     if !routes.allows(req.uri().path()) {
+        rejections::note(Listener::H3, Rejection::NotFound, peer);
         return send_response(&mut stream, StatusCode::NOT_FOUND, Bytes::new()).await;
     }
 
@@ -154,6 +158,7 @@ async fn handle_request(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| credentials.is_authorized(Some(v)));
         if !authorized {
+            rejections::note(Listener::H3, Rejection::Unauthorized, peer);
             return send_unauthorized(&mut stream).await;
         }
     }
@@ -177,6 +182,7 @@ async fn handle_request(
             body
         }
         _ => {
+            rejections::note(Listener::H3, Rejection::MethodNotAllowed, peer);
             return send_response(&mut stream, StatusCode::METHOD_NOT_ALLOWED, Bytes::new()).await;
         }
     };
@@ -254,6 +260,7 @@ pub const DOH3_ALPN: &[&[u8]] = &[b"h3"];
 mod tests {
     use super::*;
     use crate::DohUpstream;
+    use crate::listener::rejections::RejectionCounts;
     use crate::options::HttpVersion;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
@@ -390,12 +397,17 @@ mod tests {
             },
         );
 
+        let before = RejectionCounts::now();
         let req = make_query(42, "example.com.");
         let result = upstream.exchange(&req).await;
         assert!(matches!(
             result,
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
+        // Other tests reject requests concurrently, so only a lower bound
+        // holds.
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::H3, Rejection::Unauthorized) >= 1);
     }
 
     #[tokio::test]
@@ -516,13 +528,17 @@ mod tests {
         let req = make_query(42, "example.com.");
 
         // Wrong path: 404, not 401, so the endpoint isn't revealed.
+        let before = RejectionCounts::now();
         let result = client_for(addr, "/dns-query", None).exchange(&req).await;
         assert!(matches!(
             result,
             Err(DohError::UnexpectedStatus { status: 404, .. })
         ));
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::H3, Rejection::NotFound) >= 1);
 
         // Right path, no credentials: 401.
+        let before = RejectionCounts::now();
         let result = client_for(addr, "/s3cr3t/dns-query", None)
             .exchange(&req)
             .await;
@@ -530,6 +546,8 @@ mod tests {
             result,
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::H3, Rejection::Unauthorized) >= 1);
 
         // Right path and credentials: answered.
         let auth = Some(("alice".to_owned(), "secret".to_owned()));

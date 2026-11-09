@@ -21,6 +21,7 @@ use crate::error::DohError;
 use crate::listener::doh_auth::Credentials;
 use crate::listener::doh_routes::DohRoutes;
 use crate::listener::io::{Handler, bind_tcp};
+use crate::listener::rejections::{self, Listener, Rejection};
 
 const MAX_MSG_SIZE: usize = 65535;
 pub const DOH_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
@@ -93,7 +94,9 @@ async fn accept_loop(
         let credentials = Arc::clone(&credentials);
         let routes = Arc::clone(&routes);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, acceptor, handler, credentials, routes).await {
+            if let Err(e) =
+                handle_connection(tcp, peer, acceptor, handler, credentials, routes).await
+            {
                 tracing::warn!(%peer, error = %e, "doh connection failed");
             }
         });
@@ -102,6 +105,7 @@ async fn accept_loop(
 
 async fn handle_connection(
     tcp: tokio::net::TcpStream,
+    peer: SocketAddr,
     acceptor: TlsAcceptor,
     handler: Handler,
     credentials: Arc<Credentials>,
@@ -115,6 +119,7 @@ async fn handle_connection(
     let service = service_fn(move |req| {
         handle_request(
             req,
+            peer,
             Arc::clone(&handler),
             Arc::clone(&credentials),
             Arc::clone(&routes),
@@ -128,12 +133,13 @@ async fn handle_connection(
 
 async fn handle_request(
     req: Request<Incoming>,
+    peer: SocketAddr,
     handler: Handler,
     credentials: Arc<Credentials>,
     routes: Arc<DohRoutes>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     Ok(
-        match handle_request_inner(req, handler, credentials, routes).await {
+        match handle_request_inner(req, peer, handler, credentials, routes).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(error = %e, "doh query failed");
@@ -145,6 +151,7 @@ async fn handle_request(
 
 async fn handle_request_inner(
     req: Request<Incoming>,
+    peer: SocketAddr,
     handler: Handler,
     credentials: Arc<Credentials>,
     routes: Arc<DohRoutes>,
@@ -152,6 +159,7 @@ async fn handle_request_inner(
     // Before auth, as Go's ServeMux does, so a wrong path looks the same
     // whether or not Basic Auth is configured.
     if !routes.allows(req.uri().path()) {
+        rejections::note(Listener::Https, Rejection::NotFound, peer);
         return Ok(error_response(StatusCode::NOT_FOUND));
     }
 
@@ -162,6 +170,7 @@ async fn handle_request_inner(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| credentials.is_authorized(Some(v)));
         if !authorized {
+            rejections::note(Listener::Https, Rejection::Unauthorized, peer);
             return Ok(unauthorized_response());
         }
     }
@@ -182,7 +191,10 @@ async fn handle_request_inner(
             }
             body.to_vec()
         }
-        _ => return Ok(error_response(StatusCode::METHOD_NOT_ALLOWED)),
+        _ => {
+            rejections::note(Listener::Https, Rejection::MethodNotAllowed, peer);
+            return Ok(error_response(StatusCode::METHOD_NOT_ALLOWED));
+        }
     };
 
     let query = decode_request(dns_param.as_deref(), &body)?;
@@ -226,6 +238,7 @@ fn unauthorized_response() -> Response<Full<Bytes>> {
 mod tests {
     use super::*;
     use crate::DohUpstream;
+    use crate::listener::rejections::RejectionCounts;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
     use std::str::FromStr;
@@ -356,12 +369,17 @@ mod tests {
             },
         );
 
+        let before = RejectionCounts::now();
         let req = make_query(42, "example.com.");
         let result = upstream.exchange(&req).await;
         assert!(matches!(
             result,
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
+        // Other tests reject requests concurrently, so only a lower bound
+        // holds.
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::Https, Rejection::Unauthorized) >= 1);
     }
 
     #[tokio::test]
@@ -454,13 +472,17 @@ mod tests {
         let req = make_query(42, "example.com.");
 
         // Wrong path: 404, not 401, so the endpoint isn't revealed.
+        let before = RejectionCounts::now();
         let result = client_for(addr, "/dns-query", None).exchange(&req).await;
         assert!(matches!(
             result,
             Err(DohError::UnexpectedStatus { status: 404, .. })
         ));
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::Https, Rejection::NotFound) >= 1);
 
         // Right path, no credentials: 401.
+        let before = RejectionCounts::now();
         let result = client_for(addr, "/s3cr3t/dns-query", None)
             .exchange(&req)
             .await;
@@ -468,6 +490,8 @@ mod tests {
             result,
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
+        let delta = RejectionCounts::now().since(&before);
+        assert!(delta.get(Listener::Https, Rejection::Unauthorized) >= 1);
 
         // Right path and credentials: answered.
         let auth = Some(("alice".to_owned(), "secret".to_owned()));

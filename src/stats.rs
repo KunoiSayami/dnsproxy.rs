@@ -188,6 +188,10 @@ struct Interval {
     answered: BTreeMap<Source, u64>,
     latency_all: LatencyHistogram,
     latency: BTreeMap<Source, LatencyHistogram>,
+    /// The DoH/DoH3 rejection counters when the interval started; the next
+    /// interval's snapshot minus this one is what this record reports.
+    #[cfg(feature = "doh-server")]
+    rejected_at_start: crate::listener::rejections::RejectionCounts,
 }
 
 impl Interval {
@@ -201,6 +205,8 @@ impl Interval {
             answered: BTreeMap::new(),
             latency_all: LatencyHistogram::default(),
             latency: BTreeMap::new(),
+            #[cfg(feature = "doh-server")]
+            rejected_at_start: crate::listener::rejections::RejectionCounts::now(),
         }
     }
 }
@@ -303,10 +309,12 @@ impl Stats {
     /// line along with the local date of its start (the file it belongs
     /// in), and starts the next one.
     fn take_record(&self, now: SystemTime) -> (String, String) {
-        let cur = std::mem::replace(
-            &mut *self.current.lock().unwrap_or_else(PoisonError::into_inner),
-            Interval::new(now),
-        );
+        let (cur, diag) = {
+            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            let cur = std::mem::replace(&mut *current, Interval::new(now));
+            let diag = diag_counts(&cur, &current);
+            (cur, diag)
+        };
 
         // Upstreams sharing a label (e.g. the same server as an upstream and
         // a fallback) are reported together, under the highest-precedence
@@ -382,7 +390,7 @@ impl Stats {
             ),
             ("roles", Value::Object(roles.collect())),
             ("h3_fallback", Value::Object(Vec::new())),
-            ("diag", Value::Object(Vec::new())),
+            ("diag", Value::counts(diag)),
         ]);
         (start.date(), record.to_compact_string())
     }
@@ -422,6 +430,27 @@ impl Stats {
             }
         })
     }
+}
+
+/// The `diag` counters for `cur`, the interval just ended, given `next`,
+/// the one just started. Keys are flat (`rejected_https_401`), since
+/// `dnsstat.py summary` merges `diag` with `Counter.update()`.
+#[cfg(feature = "doh-server")]
+fn diag_counts(cur: &Interval, next: &Interval) -> Vec<(String, u64)> {
+    next.rejected_at_start
+        .since(&cur.rejected_at_start)
+        .iter()
+        .map(|(listener, why, n)| {
+            let proto = listener.as_str();
+            let status = why.status();
+            (format!("rejected_{proto}_{status}"), n)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "doh-server"))]
+fn diag_counts(_cur: &Interval, _next: &Interval) -> Vec<(String, u64)> {
+    Vec::new()
 }
 
 /// Appends `line` to `<dir>/<date>.jsonl` (mode 0600), then deletes daily
@@ -603,7 +632,7 @@ mod tests {
             r#""rcode":{"NOERROR":2,"NXDOMAIN":1,"SERVFAIL":1}"#,
             r#""answered_by":{"cache":1,"unknown":1,"h3://diana.example:8443":2}"#,
             r#""roles":{"h3://diana.example:8443":"other"}"#,
-            r#""h3_fallback":{},"diag":{}"#,
+            r#""h3_fallback":{},"diag":{"#,
         ] {
             assert!(line.contains(needle), "missing {needle} in {line}");
         }
@@ -695,6 +724,31 @@ mod tests {
             line.contains(r#""answered_by":{"cache":1,"udp-upstream:53":1}"#),
             "{line}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "doh-server")]
+    #[test]
+    fn reports_rejected_doh_requests_as_flat_diag_counters() {
+        use crate::listener::rejections::{self, Listener, Rejection};
+
+        let dir = temp_dir("diag");
+        let stats = Stats::new(dir.clone(), Duration::from_secs(300), 30, Vec::new()).unwrap();
+        let peer = "192.0.2.1:443".parse().unwrap();
+        rejections::note(Listener::Https, Rejection::Unauthorized, peer);
+        rejections::note(Listener::Https, Rejection::Unauthorized, peer);
+
+        // Listener tests may reject requests concurrently, so the count is
+        // at least 2 rather than exactly 2.
+        let (_, line) = stats.take_record(SystemTime::now());
+        let count = line
+            .split(r#""rejected_https_401":"#)
+            .nth(1)
+            .and_then(|rest| rest.split([',', '}']).next())
+            .and_then(|n| n.parse::<u64>().ok());
+        assert!(count.is_some_and(|n| n >= 2), "{line}");
+        let diag = &line[line.find(r#""diag":"#).unwrap()..];
+        assert!(diag.starts_with(r#""diag":{""#), "{line}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

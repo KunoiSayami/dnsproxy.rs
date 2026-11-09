@@ -1,6 +1,6 @@
 [package]
 name = "doh-upstream"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A DNS-over-HTTPS upstream client, ported from AdGuard dnsproxy's Go implementation"
@@ -42,7 +42,7 @@ rustls = { version = "0.23", default-features = false, features = [
 rustls-pki-types = "1"
 rustls-pemfile = { version = "2", optional = true }
 webpki-roots = "1"
-base64 = "0.22"
+base64 = "0.23"
 thiserror = "2"
 rand = "0.10"
 async-trait = "0.1"
@@ -50,7 +50,7 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = "0.6"
-lru = "0.18"
+lru = "0.19"
 
 quinn = { version = "0.11", optional = true }
 h3 = { version = "0.0.8", optional = true }
@@ -58,7 +58,7 @@ h3-quinn = { version = "0.0.10", optional = true }
 http = { version = "1", optional = true }
 
 crypto_box = { version = "0.9", features = ["salsa20"], optional = true }
-ed25519-dalek = { version = "2", features = ["rand_core"], optional = true }
+ed25519-dalek = { version = "3", features = ["rand_core"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

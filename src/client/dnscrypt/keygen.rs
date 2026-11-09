@@ -36,7 +36,7 @@ impl ResolverConfig {
     pub fn generate(provider_name: &str) -> Self {
         Self {
             provider_name: provider_name.to_owned(),
-            provider_signing_key: SigningKey::generate(&mut OsRng),
+            provider_signing_key: SigningKey::generate(&mut rand::rng()),
             resolver_secret_key: SecretKey::generate(&mut OsRng),
         }
     }

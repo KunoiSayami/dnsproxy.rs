@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn parses_valid_signed_certificate() {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = signing_key.verifying_key().to_bytes();
         let resolver_pk = [7u8; 32];
         let client_magic = *b"DNSC\0\0\0\0";
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn rejects_tampered_certificate() {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = signing_key.verifying_key().to_bytes();
         let mut cert_bytes =
             make_signed_cert(&signing_key, [7u8; 32], *b"DNSC\0\0\0\0", 2, 100, 200);
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_magic() {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = signing_key.verifying_key().to_bytes();
         let mut cert_bytes =
             make_signed_cert(&signing_key, [7u8; 32], *b"DNSC\0\0\0\0", 2, 100, 200);
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn parse_certificates_sorts_by_serial_desc() {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = signing_key.verifying_key().to_bytes();
 
         let cert1 = make_signed_cert(&signing_key, [1u8; 32], *b"DNSC\0\0\0\0", 1, 100, 200);

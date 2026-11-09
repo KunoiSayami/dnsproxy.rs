@@ -95,7 +95,7 @@ impl LatencyTracker {
     pub fn record(&self, elapsed: Duration) {
         let sample = elapsed.as_micros().min(u64::MAX as u128) as u64;
         self.avg_micros
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
                 Some(if prev == u64::MAX {
                     sample
                 } else {

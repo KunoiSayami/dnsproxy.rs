@@ -355,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_roundtrips_over_udp() {
-        let provider_signing_key = SigningKey::generate(&mut crypto_box::aead::rand_core::OsRng);
+        let provider_signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = provider_signing_key.verifying_key().to_bytes();
         let client_magic = *b"TESTMAGC";
         let (cert_bytes, resolver_kp) = make_cert(&provider_signing_key, client_magic);
@@ -409,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_falls_back_to_tcp_on_truncation() {
-        let provider_signing_key = SigningKey::generate(&mut crypto_box::aead::rand_core::OsRng);
+        let provider_signing_key = SigningKey::generate(&mut rand::rng());
         let provider_pk = provider_signing_key.verifying_key().to_bytes();
         let client_magic = *b"TESTMAGC";
         let (cert_bytes, resolver_kp) = make_cert(&provider_signing_key, client_magic);

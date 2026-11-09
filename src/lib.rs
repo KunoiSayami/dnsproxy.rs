@@ -33,5 +33,5 @@ pub use error::DohError;
 pub use listener::Credentials;
 #[cfg(feature = "doh-server")]
 pub use listener::DohRoutes;
-pub use listener::{Handler, serve, serve_all, serve_all_split, with_servfail};
+pub use listener::{Handler, serve, serve_all, serve_all_split, with_matching_edns, with_servfail};
 pub use options::{HttpVersion, Options};

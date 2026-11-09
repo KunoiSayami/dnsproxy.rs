@@ -766,6 +766,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Outermost, so every listener answers SERVFAIL when resolution fails
     // and the cache never stores those replies.
     let handler = doh_upstream::with_servfail(handler);
+    // Response OPT records agree with the request's, on every transport.
+    let handler = doh_upstream::with_matching_edns(handler);
 
     // Each listener gets its own wrapper, so stats count queries by
     // transport; in-flight tracking goes outermost, for shutdown.

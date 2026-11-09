@@ -85,13 +85,48 @@ pub fn servfail(req: &Message) -> Message {
         resp.add_query(query.clone());
     }
     if let Some(req_edns) = &req.edns {
-        let mut edns = Edns::new();
-        edns.set_version(0)
-            .set_max_payload(req_edns.max_payload())
-            .set_dnssec_ok(req_edns.flags().dnssec_ok);
-        resp.set_edns(edns);
+        resp.set_edns(response_edns(req_edns));
     }
     resp
+}
+
+/// The smallest UDP payload every client accepts (RFC 1035 section 2.3.4).
+pub const MIN_UDP_PAYLOAD: usize = 512;
+
+/// The largest response to send `req` over UDP: the UDP payload size it
+/// advertises in its OPT record, or 512 bytes without one or for anything
+/// smaller. Mirrors Go's `dnsSize`, which doesn't cap it either.
+pub fn udp_response_limit(req: &Message) -> usize {
+    req.edns
+        .as_ref()
+        .map_or(MIN_UDP_PAYLOAD, |edns| usize::from(edns.max_payload()))
+        .max(MIN_UDP_PAYLOAD)
+}
+
+/// Makes `resp`'s OPT record agree with the request's, `req_edns`, per RFC
+/// 6891 section 7: an EDNS request gets an OPT record in its response
+/// ([`response_edns`]) if the response has none, as Go's `scrub` does, and
+/// a request without EDNS gets none, which Go's leaves to chance (a cached
+/// response first fetched by an EDNS client carries one).
+pub fn match_request_edns(req_edns: Option<&Edns>, resp: &mut Message) {
+    match req_edns {
+        Some(req_edns) if resp.edns.is_none() => {
+            resp.set_edns(response_edns(req_edns));
+        }
+        Some(_) => {}
+        None => resp.edns = None,
+    }
+}
+
+/// A response OPT record for a request's `req_edns`: version 0, the
+/// request's UDP payload size, and its DO bit (RFC 3225), with no options.
+/// Like Go's `SetEdns0(udpSize, doBit)` in `scrub`.
+fn response_edns(req_edns: &Edns) -> Edns {
+    let mut edns = Edns::new();
+    edns.set_version(0)
+        .set_max_payload(req_edns.max_payload())
+        .set_dnssec_ok(req_edns.flags().dnssec_ok);
+    edns
 }
 
 /// Formats a `host:port` authority for display, bracketing `host` if it's a
@@ -281,5 +316,41 @@ mod tests {
         let decoded = Message::from_bytes(&resp.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(decoded.edns.unwrap().max_payload(), 1232);
+    }
+
+    fn edns(payload: u16, dnssec_ok: bool) -> Edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(payload).set_dnssec_ok(dnssec_ok);
+        edns
+    }
+
+    #[test]
+    fn udp_response_limit_follows_the_requests_edns_size() {
+        let mut req = make_query(1, "example.com.");
+        assert_eq!(udp_response_limit(&req), 512);
+        req.set_edns(edns(1232, false));
+        assert_eq!(udp_response_limit(&req), 1232);
+        req.set_edns(edns(65_000, false));
+        assert_eq!(udp_response_limit(&req), 65_000);
+    }
+
+    #[test]
+    fn match_request_edns_adds_or_strips_the_opt_record() {
+        // EDNS request, no OPT in the response: one is added.
+        let mut resp = make_query(1, "example.com.");
+        match_request_edns(Some(&edns(1232, true)), &mut resp);
+        let added = resp.edns.as_ref().unwrap();
+        assert_eq!(added.max_payload(), 1232);
+        assert!(added.flags().dnssec_ok);
+
+        // EDNS request, response already has OPT: kept as is.
+        let mut resp = make_query(1, "example.com.");
+        resp.set_edns(edns(4096, false));
+        match_request_edns(Some(&edns(1232, true)), &mut resp);
+        assert_eq!(resp.edns.as_ref().unwrap().max_payload(), 4096);
+
+        // No EDNS in the request: any OPT is removed.
+        match_request_edns(None, &mut resp);
+        assert!(resp.edns.is_none());
     }
 }

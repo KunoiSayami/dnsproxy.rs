@@ -14,12 +14,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::client::wire::servfail;
+use crate::client::wire::{match_request_edns, servfail, udp_response_limit};
 use crate::error::DohError;
-
-/// Per RFC 1035 section 2.3.4, and the historical default enforced by the Go
-/// client's `dns.Conn.UDPSize` when unset.
-const UDP_MAX_MSG_SIZE: usize = 512;
 
 /// Handles a decoded query and returns the response to send back. On its
 /// own, an error is only logged and the listener gives up on the query (UDP
@@ -55,6 +51,24 @@ pub fn with_servfail(handler: Handler) -> Handler {
                     Ok(fallback)
                 }
             }
+        })
+    })
+}
+
+/// Wraps `handler` so every response's OPT record agrees with the request's:
+/// added (with the client's UDP payload size and DO bit) when the request
+/// used EDNS and the response has none, removed when the request didn't use
+/// EDNS. See [`match_request_edns`]. Mirrors the OPT half of Go's
+/// `DNSContext.scrub`, which runs for every transport; the UDP listener
+/// applies the truncation half itself.
+pub fn with_matching_edns(handler: Handler) -> Handler {
+    Arc::new(move |req: Message| {
+        let handler = Arc::clone(&handler);
+        Box::pin(async move {
+            let req_edns = req.edns.clone();
+            let mut resp = handler(req).await?;
+            match_request_edns(req_edns.as_ref(), &mut resp);
+            Ok(resp)
         })
     })
 }
@@ -208,13 +222,14 @@ async fn handle_udp_packet(
 ) -> Result<(), DohError> {
     let req = Message::from_bytes(packet)
         .map_err(|e| DohError::InvalidResponse(format!("unpacking udp packet: {e}")))?;
+    let limit = udp_response_limit(&req);
 
     let mut resp = handler(req).await?;
 
     let mut bytes = resp.to_bytes()?;
-    if bytes.len() > UDP_MAX_MSG_SIZE {
-        // Truncate per RFC 1035: signal TC and drop all sections, leaving
-        // just the question, so the client retries over TCP.
+    if bytes.len() > limit {
+        // Signal TC and drop every record but the question and OPT, so the
+        // client retries over TCP.
         resp = resp.truncate();
         bytes = resp.to_bytes()?;
     }
@@ -390,5 +405,78 @@ mod tests {
         let addr = first.local_addr().unwrap().as_socket().unwrap();
         let err = new_socket(addr, Type::DGRAM, Protocol::UDP).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// Answers with 40 A records, about 700 bytes: over 512, under 1232.
+    fn large_answer_handler() -> Handler {
+        use hickory_proto::rr::{RData, Record, rdata::A};
+        Arc::new(|req: Message| {
+            Box::pin(async move {
+                let mut resp = req.clone();
+                resp.metadata.message_type = MessageType::Response;
+                let name = req.queries[0].name().clone();
+                for i in 0..40 {
+                    resp.add_answer(Record::from_rdata(
+                        name.clone(),
+                        60,
+                        RData::A(A::new(192, 0, 2, i)),
+                    ));
+                }
+                Ok(resp)
+            })
+        })
+    }
+
+    async fn udp_exchange(handler: Handler, req: &Message) -> Message {
+        let server = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(udp_loop(server, handler));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&req.to_bytes().unwrap(), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        Message::from_bytes(&buf[..len]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_truncates_at_512_bytes_without_edns() {
+        let handler = with_matching_edns(large_answer_handler());
+        let resp = udp_exchange(handler, &make_query(1, "example.com.")).await;
+        assert!(resp.metadata.truncation);
+        assert!(resp.answers.is_empty());
+        assert!(resp.edns.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_honors_the_clients_edns_buffer_size() {
+        use hickory_proto::op::Edns;
+        let mut req = make_query(1, "example.com.");
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        req.set_edns(edns);
+
+        let resp = udp_exchange(with_matching_edns(large_answer_handler()), &req).await;
+        assert!(!resp.metadata.truncation);
+        assert_eq!(resp.answers.len(), 40);
+        // The handler sent no OPT; the wrapper added one.
+        assert_eq!(resp.edns.as_ref().unwrap().max_payload(), 1232);
+
+        // A smaller advertised size still truncates, keeping the OPT.
+        let mut edns = Edns::new();
+        edns.set_max_payload(600);
+        req.set_edns(edns);
+        let resp = udp_exchange(with_matching_edns(large_answer_handler()), &req).await;
+        assert!(resp.metadata.truncation);
+        assert!(resp.answers.is_empty());
+        assert!(resp.edns.is_some());
     }
 }

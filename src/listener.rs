@@ -23,7 +23,7 @@ pub mod tls_config;
 pub use doh_auth::Credentials;
 #[cfg(feature = "doh-server")]
 pub use doh_routes::DohRoutes;
-pub use io::{Handler, serve, serve_all, serve_all_split, with_servfail};
+pub use io::{Handler, serve, serve_all, serve_all_split, with_matching_edns, with_servfail};
 
 use std::future::Future;
 use std::sync::{Mutex, PoisonError};

@@ -12,8 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use hickory_proto::op::Message;
 use rand::seq::SliceRandom;
+use tokio::time::{Instant, sleep_until};
 
 use crate::client::upstream::TrackedUpstream;
 use crate::client::upstream_url::{parse_any_upstream, redact_url};
@@ -50,7 +53,38 @@ pub enum UpstreamMode {
     /// yet) go first, in random order. Mirrors Go's `exchangeUpstreams` and
     /// `calcWeights` (`proxy/exchange.go`), whose default weight of 1 for an
     /// untested upstream likewise outranks any measured one.
+    ///
+    /// Unlike Go, attempts are hedged rather than strictly sequential: if
+    /// the upstream being tried hasn't answered within [`hedge_delay`]
+    /// (about twice its average latency), the next one is started alongside
+    /// it, and whichever answers first wins. A silently failing upstream
+    /// then costs a short delay instead of the full `--timeout`.
     LoadBalance,
+
+    /// Send each query to every upstream in the group at once and use the
+    /// first successful answer. Mirrors Go's `UpstreamModeParallel`
+    /// (`upstream.ExchangeParallel`): the best latency, at the cost of
+    /// multiplying upstream traffic by the group's size.
+    Parallel,
+}
+
+/// Lower bound for [`hedge_delay`], so an upstream that usually answers in
+/// a few milliseconds isn't hedged on ordinary jitter.
+const HEDGE_DELAY_MIN: Duration = Duration::from_millis(50);
+
+/// Upper bound for [`hedge_delay`], and the delay for an upstream with no
+/// measurements yet: well inside the few seconds a stub resolver or browser
+/// waits before giving up on a query.
+const HEDGE_DELAY_MAX: Duration = Duration::from_secs(1);
+
+/// How long [`UpstreamMode::LoadBalance`] waits for `upstream` to answer
+/// before also starting the next one: twice its average latency, clamped to
+/// [`HEDGE_DELAY_MIN`]..=[`HEDGE_DELAY_MAX`].
+fn hedge_delay(upstream: &TrackedUpstream) -> Duration {
+    upstream.latency().average().map_or(HEDGE_DELAY_MAX, |avg| {
+        avg.saturating_mul(2)
+            .clamp(HEDGE_DELAY_MIN, HEDGE_DELAY_MAX)
+    })
 }
 
 /// One domain rule's or the default group's upstreams, plus the state
@@ -70,7 +104,7 @@ impl UpstreamGroup {
     /// Returns this group's upstreams ordered per `mode`.
     fn ordered(&self, mode: UpstreamMode) -> Vec<Arc<TrackedUpstream>> {
         match mode {
-            UpstreamMode::Ordered => self.upstreams.clone(),
+            UpstreamMode::Ordered | UpstreamMode::Parallel => self.upstreams.clone(),
             UpstreamMode::RoundRobin => {
                 let len = self.upstreams.len();
                 if len == 0 {
@@ -256,18 +290,26 @@ impl UpstreamConfig {
             .map(|q| q.name().to_ascii())
             .unwrap_or_default();
         let upstreams = self.upstreams_for(&name);
-
-        let mut last_err = None;
-        for upstream in upstreams {
-            match upstream.exchange(req).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => last_err = Some(e),
-            }
+        if upstreams.is_empty() {
+            return Err(DohError::Bootstrap(format!(
+                "no upstreams configured for {name:?}"
+            )));
         }
 
-        Err(last_err.unwrap_or(DohError::Bootstrap(format!(
-            "no upstreams configured for {name:?}"
-        ))))
+        match self.mode {
+            UpstreamMode::Ordered | UpstreamMode::RoundRobin => {
+                let mut last_err = None;
+                for upstream in upstreams {
+                    match upstream.exchange(req).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(last_err.expect("at least one upstream was tried"))
+            }
+            UpstreamMode::LoadBalance => race(upstreams, req, hedge_delay).await,
+            UpstreamMode::Parallel => race(upstreams, req, |_| Duration::ZERO).await,
+        }
     }
 }
 
@@ -281,6 +323,73 @@ pub fn redact_rule(line: &str) -> String {
     };
     let redacted: Vec<String> = upstreams.split_whitespace().map(redact_url).collect();
     format!("{prefix}{}", redacted.join(" "))
+}
+
+/// Tries `upstreams` in order, starting each one after the previous attempt
+/// fails or after `hedge_delay(previous)` passes without an answer, whichever
+/// comes first, and returns the first successful answer. A zero delay starts
+/// them all at once. Returns the last error if every attempt fails.
+///
+/// Attempts still in flight when one succeeds aren't cancelled: they finish
+/// in a background task, as Go's `ExchangeParallel` goroutines do, so each
+/// upstream's latency is still recorded. In particular, an upstream that was
+/// hedged around because it stopped answering still records its failure
+/// penalty, rather than keeping a good average and being tried first again.
+async fn race(
+    upstreams: Vec<Arc<TrackedUpstream>>,
+    req: &Message,
+    hedge_delay: fn(&TrackedUpstream) -> Duration,
+) -> Result<Message, DohError> {
+    let req = Arc::new(req.clone());
+    let mut waiting = upstreams.into_iter();
+    let mut running = FuturesUnordered::new();
+    let mut last_err = None;
+    // When to start the next waiting upstream if nothing has answered.
+    let mut next_start: Option<Instant> = None;
+    let mut start_next = true;
+
+    loop {
+        while start_next {
+            start_next = false;
+            next_start = None;
+            let Some(upstream) = waiting.next() else {
+                break;
+            };
+            if !running.is_empty() {
+                tracing::debug!(addr = %upstream.address(), "hedging query to next upstream");
+            }
+            let delay = hedge_delay(&upstream);
+            let req = Arc::clone(&req);
+            running.push(async move { upstream.exchange(&req).await });
+            if delay.is_zero() {
+                start_next = true;
+            } else {
+                next_start = Some(Instant::now() + delay);
+            }
+        }
+
+        if running.is_empty() {
+            return Err(last_err.expect("at least one upstream was tried"));
+        }
+
+        tokio::select! {
+            Some(result) = running.next() => match result {
+                Ok(resp) => {
+                    if !running.is_empty() {
+                        tokio::spawn(async move { while running.next().await.is_some() {} });
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    start_next = true;
+                }
+            },
+            () = sleep_until(next_start.unwrap_or_else(Instant::now)), if next_start.is_some() => {
+                start_next = true;
+            }
+        }
+    }
 }
 
 /// Splits one config line into its upstream address(es) and the domains it's
@@ -632,5 +741,194 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(!errs[0].1.contains("s3cr3t"), "{}", errs[0].1);
         assert!(!errs[0].1.contains("u:p"), "{}", errs[0].1);
+    }
+
+    /// A local UDP DNS server that echoes each query back as a response
+    /// after `delay`, or never answers if `delay` is `None`. Returns its
+    /// address and a count of queries received.
+    async fn udp_server(delay: Option<Duration>) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        use hickory_proto::op::MessageType;
+        use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Some(delay) = delay else { continue };
+                let mut resp = Message::from_bytes(&buf[..len]).unwrap();
+                resp.metadata.message_type = MessageType::Response;
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = socket.send_to(&resp.to_bytes().unwrap(), peer).await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// An address nothing listens on, so a connected UDP socket gets
+    /// "connection refused" right away.
+    fn closed_udp_port() -> std::net::SocketAddr {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    fn query() -> Message {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let mut msg = Message::new(7, MessageType::Query, OpCode::Query);
+        msg.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        msg
+    }
+
+    fn udp_config(
+        addrs: &[std::net::SocketAddr],
+        mode: UpstreamMode,
+        timeout: Duration,
+    ) -> UpstreamConfig {
+        let upstreams: Vec<String> = addrs.iter().map(|a| format!("udp://{a}")).collect();
+        let line = format!("[/example.com/]{}", upstreams.join(" "));
+        let opts = Options {
+            timeout: Some(timeout),
+            ..Default::default()
+        };
+        UpstreamConfig::parse_with_mode(&[line.as_str()], &opts, mode).unwrap()
+    }
+
+    fn tracked(cfg: &UpstreamConfig, addr: std::net::SocketAddr) -> Arc<TrackedUpstream> {
+        cfg.upstreams_for("example.com.")
+            .into_iter()
+            .find(|u| u.address() == format!("udp://{addr}"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parallel_queries_every_upstream_and_returns_the_first_answer() {
+        let (slow, slow_hits) = udp_server(Some(Duration::from_millis(500))).await;
+        let (fast, fast_hits) = udp_server(Some(Duration::from_millis(10))).await;
+        let cfg = udp_config(
+            &[slow, fast],
+            UpstreamMode::Parallel,
+            Duration::from_secs(2),
+        );
+
+        let start = std::time::Instant::now();
+        let resp = cfg.exchange(&query()).await.unwrap();
+        assert_eq!(resp.metadata.id, 7);
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(slow_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_hits.load(Ordering::SeqCst), 1);
+
+        // The slow upstream's attempt finishes in the background and is
+        // recorded as a success, not a failure.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let slow_avg = tracked(&cfg, slow).latency().average().unwrap();
+        assert!(slow_avg < Duration::from_secs(1), "{slow_avg:?}");
+    }
+
+    #[tokio::test]
+    async fn parallel_fails_only_once_every_upstream_has_failed() {
+        let (a, _) = udp_server(None).await;
+        let (b, _) = udp_server(None).await;
+        let cfg = udp_config(&[a, b], UpstreamMode::Parallel, Duration::from_millis(200));
+
+        let start = std::time::Instant::now();
+        assert!(cfg.exchange(&query()).await.is_err());
+        // Concurrent, so one timeout's worth, not two.
+        assert!(
+            start.elapsed() < Duration::from_millis(350),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_balance_hedges_around_a_silent_upstream() {
+        let (silent, silent_hits) = udp_server(None).await;
+        let (answering, _) = udp_server(Some(Duration::from_millis(10))).await;
+        let cfg = udp_config(
+            &[silent, answering],
+            UpstreamMode::LoadBalance,
+            Duration::from_millis(500),
+        );
+        // The silent one looks fastest, so it's drawn first ~99.99% of the
+        // time and hedged after the 50 ms minimum.
+        let silent_tracked = tracked(&cfg, silent);
+        silent_tracked.latency().record(Duration::from_millis(1));
+        tracked(&cfg, answering)
+            .latency()
+            .record(Duration::from_secs(10));
+
+        let start = std::time::Instant::now();
+        let resp = cfg.exchange(&query()).await.unwrap();
+        assert_eq!(resp.metadata.id, 7);
+        // Without hedging this would wait out the 500 ms timeout.
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(silent_hits.load(Ordering::SeqCst), 1);
+
+        // The abandoned attempt still times out in the background and
+        // records the failure penalty, so the silent upstream sinks.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let avg = silent_tracked.latency().average().unwrap();
+        assert!(avg > Duration::from_secs(1), "{avg:?}");
+    }
+
+    #[tokio::test]
+    async fn load_balance_starts_the_next_upstream_as_soon_as_one_fails() {
+        let refused = closed_udp_port();
+        let (answering, _) = udp_server(Some(Duration::from_millis(5))).await;
+        let cfg = udp_config(
+            &[refused, answering],
+            UpstreamMode::LoadBalance,
+            Duration::from_secs(2),
+        );
+        // Untested, so the refused upstream goes first, with the maximum
+        // 1 s hedge delay; only an immediate failover answers sooner.
+        tracked(&cfg, answering)
+            .latency()
+            .record(Duration::from_millis(5));
+
+        let start = std::time::Instant::now();
+        cfg.exchange(&query()).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_balance_does_not_hedge_quick_answers() {
+        let (a, a_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let (b, b_hits) = udp_server(Some(Duration::from_millis(5))).await;
+        let cfg = udp_config(&[a, b], UpstreamMode::LoadBalance, Duration::from_secs(2));
+        tracked(&cfg, a).latency().record(Duration::from_millis(5));
+        tracked(&cfg, b).latency().record(Duration::from_millis(5));
+
+        cfg.exchange(&query()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let total = a_hits.load(Ordering::SeqCst) + b_hits.load(Ordering::SeqCst);
+        assert_eq!(total, 1);
     }
 }

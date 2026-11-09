@@ -84,6 +84,7 @@ enum UpstreamModeArg {
     Ordered,
     RoundRobin,
     LoadBalance,
+    Parallel,
 }
 
 impl From<UpstreamModeArg> for UpstreamMode {
@@ -92,6 +93,7 @@ impl From<UpstreamModeArg> for UpstreamMode {
             UpstreamModeArg::Ordered => UpstreamMode::Ordered,
             UpstreamModeArg::RoundRobin => UpstreamMode::RoundRobin,
             UpstreamModeArg::LoadBalance => UpstreamMode::LoadBalance,
+            UpstreamModeArg::Parallel => UpstreamMode::Parallel,
         }
     }
 }
@@ -139,13 +141,16 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     timeout: u64,
 
-    /// How to order the upstreams within a rule before trying them:
-    /// "ordered" always prefers the first-configured upstream, falling back
-    /// to later ones only on failure; "round-robin" rotates the starting
-    /// upstream on each query; "load-balance" picks at random, weighted by
-    /// each upstream's recent average latency (a failure counts as 5 s),
-    /// so traffic spreads in proportion to speed and a failing upstream
-    /// sinks until it answers again.
+    /// How to use the upstreams within a rule: "ordered" always prefers the
+    /// first-configured upstream, falling back to later ones only on
+    /// failure; "round-robin" rotates the starting upstream on each query;
+    /// "load-balance" picks at random, weighted by each upstream's recent
+    /// average latency (a failure counts as 5 s), so traffic spreads in
+    /// proportion to speed and a failing upstream sinks until it answers
+    /// again, and also starts the next upstream if the first hasn't
+    /// answered within about twice its average latency (50 ms to 1 s);
+    /// "parallel" sends every query to all of them at once and uses the
+    /// first answer.
     #[arg(long, value_enum, default_value_t = UpstreamModeArg::Ordered)]
     upstream_mode: UpstreamModeArg,
 

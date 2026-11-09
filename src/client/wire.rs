@@ -3,7 +3,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hickory_proto::op::{Message, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, OpCode, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 
 use crate::error::DohError;
@@ -64,8 +64,12 @@ pub fn encode_response(resp: &Message) -> Result<Vec<u8>, DohError> {
 /// Builds a SERVFAIL reply to `req`, for when it couldn't be resolved.
 /// Mirrors `genServerFailure` in `proxy/proxy.go`, i.e. miekg/dns's
 /// `Msg.SetRcode`: copies the ID and opcode, the RD and CD bits (for
-/// standard queries only), and the first question, and sets RA. Like the Go
-/// version, it doesn't echo the request's EDNS OPT record.
+/// standard queries only), and the first question, and sets RA.
+///
+/// Unlike the Go version, it answers an EDNS request with an OPT record, as
+/// RFC 6891 section 7 requires of an EDNS-aware responder: version 0, the
+/// request's UDP payload size, and the DO bit copied per RFC 3225. The
+/// request's EDNS options (cookies, client subnet, ...) aren't echoed.
 pub fn servfail(req: &Message) -> Message {
     let mut resp = Message::error_msg(
         req.metadata.id,
@@ -79,6 +83,13 @@ pub fn servfail(req: &Message) -> Message {
     resp.metadata.recursion_available = true;
     if let Some(query) = req.queries.first() {
         resp.add_query(query.clone());
+    }
+    if let Some(req_edns) = &req.edns {
+        let mut edns = Edns::new();
+        edns.set_version(0)
+            .set_max_payload(req_edns.max_payload())
+            .set_dnssec_ok(req_edns.flags().dnssec_ok);
+        resp.set_edns(edns);
     }
     resp
 }
@@ -244,5 +255,31 @@ mod tests {
         assert_eq!(resp.queries, vec![req.queries[0].clone()]);
         assert!(resp.answers.is_empty());
         assert!(resp.edns.is_none());
+    }
+
+    #[test]
+    fn servfail_answers_edns_request_with_opt_record() {
+        let mut req = make_query(1, "example.com.");
+        let mut req_edns = Edns::new();
+        req_edns.set_max_payload(1232).set_dnssec_ok(true);
+        req_edns
+            .options_mut()
+            .insert(hickory_proto::rr::rdata::opt::EdnsOption::Unknown(
+                10,
+                vec![0; 8],
+            ));
+        req.set_edns(req_edns);
+
+        let resp = servfail(&req);
+        let edns = resp.edns.as_ref().expect("EDNS request gets an OPT record");
+        assert_eq!(edns.version(), 0);
+        assert_eq!(edns.max_payload(), 1232);
+        assert!(edns.flags().dnssec_ok);
+        assert!(edns.options().as_ref().is_empty());
+
+        // And it survives the wire roundtrip.
+        let decoded = Message::from_bytes(&resp.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(decoded.edns.unwrap().max_payload(), 1232);
     }
 }

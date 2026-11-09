@@ -92,24 +92,19 @@ pub async fn serve_all(addrs: &[SocketAddr], handler: Handler) -> Result<(), Doh
     Ok(())
 }
 
-/// Builds a bound, non-blocking `socket2::Socket` for `addr` with
-/// `SO_REUSEADDR` set, and `IPV6_V6ONLY` on IPv6 sockets so IPv4 and IPv6
-/// wildcard binds don't collide.
+/// Builds a bound, non-blocking `socket2::Socket` for `addr`, setting
+/// `IPV6_V6ONLY` on IPv6 sockets so IPv4 and IPv6 wildcard binds don't
+/// collide.
+///
+/// `SO_REUSEADDR` is set on TCP sockets only, so a restart can rebind while
+/// old connections sit in `TIME_WAIT`. On UDP it would let several sockets
+/// share one port on Linux, so a second listener on a port already in use
+/// would bind silently and steal its traffic instead of failing.
 pub(crate) fn new_socket(
     addr: SocketAddr,
     ty: Type,
     protocol: Protocol,
 ) -> std::io::Result<Socket> {
-    let socket = unbound_socket(addr, ty, protocol)?;
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.set_nonblocking(true)?;
-    Ok(socket)
-}
-
-/// Creates a socket of `addr`'s family, setting `IPV6_V6ONLY` on IPv6
-/// sockets, without binding it.
-fn unbound_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
     } else {
@@ -119,6 +114,11 @@ fn unbound_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Re
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }
+    if ty == Type::STREAM {
+        socket.set_reuse_address(true)?;
+    }
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
     Ok(socket)
 }
 
@@ -127,18 +127,13 @@ fn unbound_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Re
 /// `quinn::Endpoint::server` binds a plain `std::net::UdpSocket`, which for
 /// `[::]` is dual-stack wherever `net.ipv6.bindv6only=0` (the Linux
 /// default), so it would collide with an IPv4 wildcard bind on the same port
-/// and fail with `EADDRINUSE`. This sets `IPV6_V6ONLY` first, like the other
-/// listeners' binds. Unlike [`new_socket`], it leaves `SO_REUSEADDR` unset:
-/// on Linux that option lets several UDP sockets share a port, so a second
-/// listener on the same port would bind silently instead of failing.
+/// and fail with `EADDRINUSE`. This binds through [`new_socket`] instead.
 #[cfg(any(feature = "doq-server", feature = "http3-server"))]
 pub(crate) fn bind_quic_server(
     addr: SocketAddr,
     server_config: quinn::ServerConfig,
 ) -> Result<quinn::Endpoint, DohError> {
-    let socket = unbound_socket(addr, Type::DGRAM, Protocol::UDP)?;
-    socket.bind(&addr.into())?;
-    socket.set_nonblocking(true)?;
+    let socket = new_socket(addr, Type::DGRAM, Protocol::UDP)?;
     let runtime =
         quinn::default_runtime().ok_or_else(|| DohError::Quic("no async runtime found".into()))?;
     quinn::Endpoint::new(
@@ -368,5 +363,13 @@ mod tests {
             .unwrap();
             assert_servfail(&Message::from_bytes(&bytes).unwrap(), id);
         }
+    }
+
+    #[test]
+    fn udp_bind_on_a_port_in_use_fails() {
+        let first = new_socket("127.0.0.1:0".parse().unwrap(), Type::DGRAM, Protocol::UDP).unwrap();
+        let addr = first.local_addr().unwrap().as_socket().unwrap();
+        let err = new_socket(addr, Type::DGRAM, Protocol::UDP).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 }

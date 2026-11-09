@@ -3,7 +3,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 
 use crate::error::DohError;
@@ -59,6 +59,28 @@ pub fn decode_request(dns_param: Option<&str>, body: &[u8]) -> Result<Message, D
 /// [`decode_response`], which the DoH client uses instead.
 pub fn encode_response(resp: &Message) -> Result<Vec<u8>, DohError> {
     Ok(resp.to_bytes()?)
+}
+
+/// Builds a SERVFAIL reply to `req`, for when it couldn't be resolved.
+/// Mirrors `genServerFailure` in `proxy/proxy.go`, i.e. miekg/dns's
+/// `Msg.SetRcode`: copies the ID and opcode, the RD and CD bits (for
+/// standard queries only), and the first question, and sets RA. Like the Go
+/// version, it doesn't echo the request's EDNS OPT record.
+pub fn servfail(req: &Message) -> Message {
+    let mut resp = Message::error_msg(
+        req.metadata.id,
+        req.metadata.op_code,
+        ResponseCode::ServFail,
+    );
+    if req.metadata.op_code == OpCode::Query {
+        resp.metadata.recursion_desired = req.metadata.recursion_desired;
+        resp.metadata.checking_disabled = req.metadata.checking_disabled;
+    }
+    resp.metadata.recursion_available = true;
+    if let Some(query) = req.queries.first() {
+        resp.add_query(query.clone());
+    }
+    resp
 }
 
 /// Formats a `host:port` authority for display, bracketing `host` if it's a
@@ -199,5 +221,28 @@ mod tests {
 
         let err = decode_response(&body, &req, 1).unwrap_err();
         assert!(matches!(err, DohError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn servfail_copies_id_flags_and_first_question() {
+        let mut req = make_query(0x1234, "example.com.");
+        req.metadata.recursion_desired = true;
+        req.metadata.checking_disabled = true;
+        req.add_query(Query::query(
+            Name::from_str("second.example.").unwrap(),
+            RecordType::AAAA,
+        ));
+
+        let resp = servfail(&req);
+        assert_eq!(resp.metadata.id, 0x1234);
+        assert_eq!(resp.metadata.message_type, MessageType::Response);
+        assert_eq!(resp.metadata.op_code, OpCode::Query);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert!(resp.metadata.recursion_desired);
+        assert!(resp.metadata.checking_disabled);
+        assert!(resp.metadata.recursion_available);
+        assert_eq!(resp.queries, vec![req.queries[0].clone()]);
+        assert!(resp.answers.is_empty());
+        assert!(resp.edns.is_none());
     }
 }

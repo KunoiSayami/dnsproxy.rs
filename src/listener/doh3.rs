@@ -14,7 +14,7 @@ use crate::client::wire::{decode_request, encode_response};
 use crate::error::DohError;
 use crate::listener::doh::find_dns_param;
 use crate::listener::doh_auth::Credentials;
-use crate::listener::io::Handler;
+use crate::listener::io::{Handler, bind_quic_server};
 
 const MAX_MSG_SIZE: usize = 65535;
 
@@ -52,8 +52,7 @@ pub async fn serve(
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_config).clone())
         .map_err(|e| DohError::Quic(e.to_string()))?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-    let endpoint =
-        quinn::Endpoint::server(server_config, addr).map_err(|e| DohError::Quic(e.to_string()))?;
+    let endpoint = bind_quic_server(addr, server_config)?;
     let bound_addr = endpoint
         .local_addr()
         .map_err(|e| DohError::Quic(e.to_string()))?;
@@ -336,5 +335,64 @@ mod tests {
             result,
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn answers_servfail_with_http_200_when_handler_fails() {
+        let failing: Handler = Arc::new(|_req: Message| {
+            Box::pin(async move { Err(DohError::Bootstrap("all upstreams failed".into())) })
+        });
+        let addr = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(server_tls_config()),
+            crate::listener::io::with_servfail(failing),
+            no_credentials(),
+        )
+        .await
+        .unwrap();
+
+        let upstream = DohUpstream::new(
+            "localhost",
+            Some(addr.port()),
+            "/dns-query",
+            crate::options::Options {
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
+                http_versions: vec![HttpVersion::Http3],
+                timeout: Some(Duration::from_secs(5)),
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+        );
+
+        // The client errors on any non-200 status, so `Ok` means HTTP 200.
+        let req = make_query(42, "example.com.");
+        let resp = upstream.exchange(&req).await.unwrap();
+        assert_eq!(resp.metadata.id, 42);
+        assert_eq!(
+            resp.metadata.response_code,
+            hickory_proto::op::ResponseCode::ServFail
+        );
+    }
+
+    #[tokio::test]
+    async fn binds_ipv4_and_ipv6_wildcards_on_the_same_port() {
+        if std::net::UdpSocket::bind("[::]:0").is_err() {
+            return; // no IPv6 on this host
+        }
+        let tls_config = Arc::new(server_tls_config());
+        let v4 = serve(
+            "0.0.0.0:0".parse().unwrap(),
+            Arc::clone(&tls_config),
+            echo_handler(),
+            no_credentials(),
+        )
+        .await
+        .unwrap();
+        let v6_addr = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), v4.port());
+        serve(v6_addr, tls_config, echo_handler(), no_credentials())
+            .await
+            .expect("[::] bind must not collide with 0.0.0.0 on the same port");
     }
 }

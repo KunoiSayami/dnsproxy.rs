@@ -14,20 +14,48 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
+use crate::client::wire::servfail;
 use crate::error::DohError;
 
 /// Per RFC 1035 section 2.3.4, and the historical default enforced by the Go
 /// client's `dns.Conn.UDPSize` when unset.
 const UDP_MAX_MSG_SIZE: usize = 512;
 
-/// Handles a decoded query and returns the response to send back. Errors are
-/// logged and the query is dropped (no response), matching the Go server's
-/// behavior of not answering when handling fails.
+/// Handles a decoded query and returns the response to send back. On its
+/// own, an error is only logged and the listener gives up on the query (UDP
+/// sends nothing, TCP/DoT close the connection, DoH answers HTTP 400); wrap
+/// the handler with [`with_servfail`] to answer SERVFAIL instead, as the Go
+/// server does.
 pub type Handler = Arc<
     dyn Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message, DohError>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Wraps `handler` so that a query it fails to resolve is answered with
+/// SERVFAIL (see [`servfail`]) instead of an error, mirroring how
+/// `Proxy.handleDNSRequest` answers every resolution failure. Every listener
+/// sharing the wrapped handler gets the behaviour; requests a listener can't
+/// decode never reach the handler and are still rejected per transport.
+///
+/// The error is logged here, since the listener no longer sees it. Wrap
+/// outside any cache, so SERVFAIL replies aren't cached.
+pub fn with_servfail(handler: Handler) -> Handler {
+    Arc::new(move |req: Message| {
+        let handler = Arc::clone(&handler);
+        Box::pin(async move {
+            // The handler consumes `req`, so build the fallback up front.
+            let fallback = servfail(&req);
+            match handler(req).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    tracing::warn!(error = %e, "resolving query failed; answering servfail");
+                    Ok(fallback)
+                }
+            }
+        })
+    })
+}
 
 /// Runs UDP and TCP listeners on `addr`, dispatching every decoded query to
 /// `handler` and writing back whatever it returns. Runs until the process is
@@ -64,13 +92,24 @@ pub async fn serve_all(addrs: &[SocketAddr], handler: Handler) -> Result<(), Doh
     Ok(())
 }
 
-/// Builds a `socket2::Socket` for `addr`, setting `IPV6_V6ONLY` on IPv6
-/// sockets so IPv4 and IPv6 wildcard binds don't collide.
+/// Builds a bound, non-blocking `socket2::Socket` for `addr` with
+/// `SO_REUSEADDR` set, and `IPV6_V6ONLY` on IPv6 sockets so IPv4 and IPv6
+/// wildcard binds don't collide.
 pub(crate) fn new_socket(
     addr: SocketAddr,
     ty: Type,
     protocol: Protocol,
 ) -> std::io::Result<Socket> {
+    let socket = unbound_socket(addr, ty, protocol)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+/// Creates a socket of `addr`'s family, setting `IPV6_V6ONLY` on IPv6
+/// sockets, without binding it.
+fn unbound_socket(addr: SocketAddr, ty: Type, protocol: Protocol) -> std::io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
     } else {
@@ -80,10 +119,35 @@ pub(crate) fn new_socket(
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }
-    socket.set_reuse_address(true)?;
+    Ok(socket)
+}
+
+/// Binds a QUIC server endpoint (DoQ, DoH3) on `addr`.
+///
+/// `quinn::Endpoint::server` binds a plain `std::net::UdpSocket`, which for
+/// `[::]` is dual-stack wherever `net.ipv6.bindv6only=0` (the Linux
+/// default), so it would collide with an IPv4 wildcard bind on the same port
+/// and fail with `EADDRINUSE`. This sets `IPV6_V6ONLY` first, like the other
+/// listeners' binds. Unlike [`new_socket`], it leaves `SO_REUSEADDR` unset:
+/// on Linux that option lets several UDP sockets share a port, so a second
+/// listener on the same port would bind silently instead of failing.
+#[cfg(any(feature = "doq-server", feature = "http3-server"))]
+pub(crate) fn bind_quic_server(
+    addr: SocketAddr,
+    server_config: quinn::ServerConfig,
+) -> Result<quinn::Endpoint, DohError> {
+    let socket = unbound_socket(addr, Type::DGRAM, Protocol::UDP)?;
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
-    Ok(socket)
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| DohError::Quic("no async runtime found".into()))?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into(),
+        runtime,
+    )
+    .map_err(|e| DohError::Quic(e.to_string()))
 }
 
 pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -211,4 +275,98 @@ pub(crate) async fn write_prefixed<S: tokio::io::AsyncWrite + Unpin>(
     stream.write_u16(len).await?;
     stream.write_all(body).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RecordType};
+    use std::str::FromStr;
+
+    fn make_query(id: u16, name: &str) -> Message {
+        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        msg
+    }
+
+    fn failing_handler() -> Handler {
+        Arc::new(|_req: Message| {
+            Box::pin(async move { Err(DohError::Bootstrap("all upstreams failed".into())) })
+        })
+    }
+
+    fn assert_servfail(resp: &Message, id: u16) {
+        assert_eq!(resp.metadata.id, id);
+        assert_eq!(resp.metadata.message_type, MessageType::Response);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert!(resp.metadata.recursion_desired);
+        assert_eq!(resp.queries.len(), 1);
+        assert_eq!(
+            resp.queries[0].name(),
+            &Name::from_str("example.com.").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn with_servfail_passes_successful_responses_through() {
+        let handler = with_servfail(Arc::new(|req: Message| {
+            Box::pin(async move {
+                let mut resp = req.clone();
+                resp.metadata.message_type = MessageType::Response;
+                Ok(resp)
+            })
+        }));
+        let resp = handler(make_query(7, "example.com.")).await.unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    #[tokio::test]
+    async fn udp_answers_servfail_when_handler_fails() {
+        let server = bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(udp_loop(server, with_servfail(failing_handler())));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let req = make_query(0x4242, "example.com.");
+        client
+            .send_to(&req.to_bytes().unwrap(), addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("udp listener should answer instead of dropping the query")
+        .unwrap();
+        assert_servfail(&Message::from_bytes(&buf[..len]).unwrap(), 0x4242);
+    }
+
+    #[tokio::test]
+    async fn tcp_answers_servfail_and_keeps_connection_open() {
+        let server = bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(tcp_loop(server, with_servfail(failing_handler())));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Two queries on one connection: a failure must not close it.
+        for id in [1, 2] {
+            let req = make_query(id, "example.com.");
+            write_prefixed(&mut stream, &req.to_bytes().unwrap())
+                .await
+                .unwrap();
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_prefixed(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_servfail(&Message::from_bytes(&bytes).unwrap(), id);
+        }
+    }
 }

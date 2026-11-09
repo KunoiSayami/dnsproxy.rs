@@ -623,6 +623,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(size = args.cache_size, "caching enabled");
         handler = Arc::new(Cache::new(cache_opts)).into_handler(handler);
     }
+    // Outermost, so every listener answers SERVFAIL when resolution fails
+    // and the cache never stores those replies.
+    let handler = doh_upstream::with_servfail(handler);
     doh_upstream::serve_all(&listen_addrs, handler.clone()).await?;
 
     #[cfg(any(feature = "doq-server", feature = "dot-server", feature = "doh-server"))]

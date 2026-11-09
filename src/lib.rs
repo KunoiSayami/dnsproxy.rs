@@ -28,5 +28,5 @@ pub use client::{
 pub use error::DohError;
 #[cfg(feature = "doh-server")]
 pub use listener::Credentials;
-pub use listener::{Handler, serve, serve_all};
+pub use listener::{Handler, serve, serve_all, with_servfail};
 pub use options::{HttpVersion, Options};

@@ -19,4 +19,4 @@ pub mod tls_config;
 
 #[cfg(feature = "doh-server")]
 pub use doh_auth::Credentials;
-pub use io::{Handler, serve, serve_all};
+pub use io::{Handler, serve, serve_all, with_servfail};

@@ -309,4 +309,42 @@ mod tests {
             Err(DohError::UnexpectedStatus { status: 401, .. })
         ));
     }
+
+    #[tokio::test]
+    async fn answers_servfail_with_http_200_when_handler_fails() {
+        let failing: Handler = Arc::new(|_req: Message| {
+            Box::pin(async move { Err(DohError::Bootstrap("all upstreams failed".into())) })
+        });
+        let addr = serve(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(server_tls_config()),
+            crate::listener::io::with_servfail(failing),
+            no_credentials(),
+        )
+        .await
+        .unwrap();
+
+        let upstream = DohUpstream::new(
+            "localhost",
+            Some(addr.port()),
+            "/dns-query",
+            crate::options::Options {
+                bootstrap: Some(Arc::new(crate::client::bootstrap::StaticResolver(vec![
+                    addr.ip(),
+                ]))),
+                timeout: Some(Duration::from_secs(5)),
+                insecure_skip_verify: true,
+                ..Default::default()
+            },
+        );
+
+        // The client errors on any non-200 status, so `Ok` means HTTP 200.
+        let req = make_query(42, "example.com.");
+        let resp = upstream.exchange(&req).await.unwrap();
+        assert_eq!(resp.metadata.id, 42);
+        assert_eq!(
+            resp.metadata.response_code,
+            hickory_proto::op::ResponseCode::ServFail
+        );
+    }
 }

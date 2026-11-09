@@ -9,7 +9,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use std::net::SocketAddr;
 
 use crate::error::DohError;
-use crate::listener::io::Handler;
+use crate::listener::io::{Handler, bind_quic_server};
 
 const MAX_MSG_SIZE: usize = 65535;
 pub const DOQ_ALPN: &[u8] = b"doq";
@@ -38,8 +38,7 @@ pub async fn serve(
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from((*tls_config).clone())
         .map_err(|e| DohError::Quic(e.to_string()))?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-    let endpoint =
-        quinn::Endpoint::server(server_config, addr).map_err(|e| DohError::Quic(e.to_string()))?;
+    let endpoint = bind_quic_server(addr, server_config)?;
     let bound_addr = endpoint
         .local_addr()
         .map_err(|e| DohError::Quic(e.to_string()))?;
@@ -240,5 +239,24 @@ mod tests {
         let result =
             tokio::time::timeout(Duration::from_millis(500), recv.read_exact(&mut len_buf)).await;
         assert!(result.is_err() || result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn binds_ipv4_and_ipv6_wildcards_on_the_same_port() {
+        if std::net::UdpSocket::bind("[::]:0").is_err() {
+            return; // no IPv6 on this host
+        }
+        let tls_config = Arc::new(server_tls_config());
+        let v4 = serve(
+            "0.0.0.0:0".parse().unwrap(),
+            Arc::clone(&tls_config),
+            echo_handler(),
+        )
+        .await
+        .unwrap();
+        let v6_addr = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), v4.port());
+        serve(v6_addr, tls_config, echo_handler())
+            .await
+            .expect("[::] bind must not collide with 0.0.0.0 on the same port");
     }
 }

@@ -219,6 +219,26 @@ struct Args {
     #[arg(long, default_value_t = 30, requires = "stats_dir")]
     stats_keep_days: u32,
 
+    /// Answer A, AAAA and PTR queries from hosts files before asking any
+    /// upstream, as Go dnsproxy does by default. Names not in the files, or
+    /// without an address of the queried family, still go to the upstreams.
+    /// Turn off with --hosts-file-enabled=false.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    hosts_file_enabled: bool,
+
+    /// Hosts file to answer from, instead of /etc/hosts. May be repeated;
+    /// the files are merged. Unlike the default /etc/hosts, a listed file
+    /// that can't be read stops startup.
+    #[arg(long = "hosts-files", value_name = "PATH")]
+    hosts_files: Vec<PathBuf>,
+
     /// Cache upstream responses in memory.
     #[arg(long)]
     cache: bool,
@@ -766,6 +786,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         tracing::info!(size = args.cache_size, "caching enabled");
         handler = Arc::new(Cache::new(cache_opts)).into_handler(handler);
+    }
+    // Before the cache and upstreams, as Go's middleware is; its answers
+    // aren't cached.
+    if args.hosts_file_enabled {
+        let hosts = doh_upstream::hosts::Hosts::load(&args.hosts_files)?;
+        tracing::info!(names = hosts.len(), "answering from hosts files");
+        if !hosts.is_empty() {
+            handler = Arc::new(hosts).into_handler(handler);
+        }
     }
     // Outermost, so every listener answers SERVFAIL when resolution fails
     // and the cache never stores those replies.

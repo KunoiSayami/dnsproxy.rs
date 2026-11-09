@@ -41,6 +41,9 @@ tokio::task_local! {
 pub enum Source {
     /// The response cache.
     Cache,
+    /// A hosts file (`--hosts-files`). A new key: Go's log gave
+    /// `dnsstat.py` no way to tell these apart.
+    Hosts,
     /// No upstream (or fallback) answered; the client got SERVFAIL.
     Error,
     /// Nothing reported a source (the handler isn't an
@@ -54,6 +57,7 @@ impl Source {
     fn as_str(&self) -> &str {
         match self {
             Self::Cache => "cache",
+            Self::Hosts => "hosts",
             Self::Error => "error",
             Self::Unknown => "unknown",
             Self::Upstream(label) => label,

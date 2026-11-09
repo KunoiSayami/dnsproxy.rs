@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod client;
 pub mod error;
+pub mod hosts;
 pub mod listener;
 pub mod options;
 pub mod shutdown;

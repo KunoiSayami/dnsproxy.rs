@@ -74,6 +74,8 @@ Useful flags:
 | `--http3` | Allow HTTP/3, in addition to HTTP/1.1 and HTTP/2 (requires the `http3` feature). |
 | `-v`, `--verbose` | Increase logging verbosity (repeatable). |
 | `--log-level <level>` | Default log level when `RUST_LOG` is unset (default `info`). |
+| `--hosts-file-enabled[=<bool>]` | Answer A, AAAA and PTR queries from hosts files before asking any upstream (default `true`, as in Go dnsproxy). Turn off with `--hosts-file-enabled=false`. |
+| `--hosts-files <path>` | Hosts file to answer from instead of `/etc/hosts`. May be repeated; a listed file that can't be read stops startup. |
 | `--cache` | Cache upstream responses in memory. |
 | `--cache-size <n>` | Maximum number of cached responses (default `1000`). Counts responses, not bytes as Go dnsproxy's `--cache-size` does; see [Migrating from Go dnsproxy](#migrating-from-go-dnsproxy). |
 | `--cache-min-ttl <secs>` | Floor applied to a cached response's TTL (default `0`). |

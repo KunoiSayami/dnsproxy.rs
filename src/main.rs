@@ -223,7 +223,11 @@ struct Args {
     #[arg(long)]
     cache: bool,
 
-    /// Maximum number of cached responses.
+    /// Maximum number of cached responses. Unlike Go dnsproxy's
+    /// --cache-size, this counts responses, not bytes: don't copy a Go value
+    /// over. A Go entry takes roughly 200-400 bytes, so divide a Go byte
+    /// count by about 250 (Go's default 65536 is about 250 entries, 1048576
+    /// about 4000). Each entry here costs about 1 KiB of memory.
     #[arg(long, default_value_t = 1000)]
     cache_size: usize,
 

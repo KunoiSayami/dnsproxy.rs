@@ -75,7 +75,7 @@ Useful flags:
 | `-v`, `--verbose` | Increase logging verbosity (repeatable). |
 | `--log-level <level>` | Default log level when `RUST_LOG` is unset (default `info`). |
 | `--cache` | Cache upstream responses in memory. |
-| `--cache-size <n>` | Maximum number of cached responses (default `1000`). |
+| `--cache-size <n>` | Maximum number of cached responses (default `1000`). Counts responses, not bytes as Go dnsproxy's `--cache-size` does; see [Migrating from Go dnsproxy](#migrating-from-go-dnsproxy). |
 | `--cache-min-ttl <secs>` | Floor applied to a cached response's TTL (default `0`). |
 | `--cache-max-ttl <secs>` | Ceiling applied to a cached response's TTL; `0` means unbounded (default `0`). |
 
@@ -109,6 +109,7 @@ serve("127.0.0.1:5353".parse()?, upstream.into_handler()).await?;
 | `doq` | yes | Enables DNS-over-QUIC (`quic://`) support via `quinn` |
 | `crypto-ring` | yes | Uses `ring` as rustls's crypto backend: pure Rust, no C toolchain, smaller binary |
 | `crypto-aws-lc-rs` | no | Uses `aws-lc-rs` instead: adds FIPS validation and post-quantum key exchange support, at the cost of a C/assembly build step and a larger binary |
+| `stats` | no | Built-in query statistics (`--stats-dir`), written in the JSONL format of AdGuard dnsproxy deployments' `dnsstat.py` |
 
 Exactly one of `crypto-ring`/`crypto-aws-lc-rs` must be enabled; the build
 fails at compile time otherwise. To switch backends:
@@ -116,6 +117,28 @@ fails at compile time otherwise. To switch backends:
 ```sh
 cargo build --release --no-default-features --features http3,crypto-aws-lc-rs
 ```
+
+## Migrating from Go dnsproxy
+
+### `--cache-size` counts responses, not bytes
+
+Go dnsproxy's `--cache-size` (`cache-size:` in YAML) is a byte budget,
+64 KiB by default. Here it's the number of cached responses, 1000 by
+default. Copying a Go value over would allow a cache hundreds of times
+larger than intended.
+
+A Go cache entry is its key plus the response in wire format and the
+upstream's address, typically 200 to 400 bytes. Divide a Go byte count by
+about 250:
+
+| Go `--cache-size` (bytes) | Here (responses) |
+|---|---|
+| 65536 (Go's default) | 250 |
+| 1048576 (1 MiB) | 4000 |
+
+Memory use differs too: a cached response here takes about 1 KiB (measured
+with typical two-record answers; larger answers take more), so 4000 entries
+use about 4 MiB. Go's optimistic cache (serving stale answers) isn't ported.
 
 ## Building
 
